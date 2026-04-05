@@ -16,6 +16,7 @@ GUILD_ID = 1391768913632559296
 TIMER_CHANNEL_ID = 1490304994975416451
 DAILY_POST_CHANNEL_ID = 1391768914106777724
 MEMBER_ROLE_ID = 1430004675762983073
+COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
 
 WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
@@ -114,6 +115,11 @@ def get_daily_post_channel(guild: discord.Guild) -> discord.TextChannel | None:
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
+def get_compound_status_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    channel = guild.get_channel(COMPOUND_STATUS_CHANNEL_ID)
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
 def make_error_embed(title: str, description: str) -> discord.Embed:
     return discord.Embed(
         title=title,
@@ -163,7 +169,6 @@ async def ensure_guild_and_timer_channel(
 async def gang_hours_task() -> None:
     now = datetime.now(SYDNEY_TZ)
 
-    # Monday=0 ... Friday=4, Saturday=5, Sunday=6
     if now.weekday() >= 5:
         return
 
@@ -574,6 +579,92 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
 
     await timer_channel.send(embed=embed)
     await acknowledge_redirect(interaction, "Posted timer list")
+
+
+@bot.tree.command(name="unsafe", description="Mark the compound as unsafe")
+async def unsafe_cmd(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Location",
+                "This command can only be used in a server."
+            ),
+            ephemeral=True
+        )
+        return
+
+    status_channel = get_compound_status_channel(interaction.guild)
+    if status_channel is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Missing Status Channel",
+                f"I couldn't find <#{COMPOUND_STATUS_CHANNEL_ID}>."
+            ),
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="🚨 COMPOUND UNSAFE",
+        description="Hostiles are currently breaching the compound.",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(
+        name="Warning",
+        value="Do **not** fly into the compound until further notice.",
+        inline=False
+    )
+    embed.set_footer(text=f"Marked unsafe by {interaction.user.display_name}")
+
+    await status_channel.send(embed=embed)
+    await interaction.response.send_message(
+        f"✅ Posted unsafe alert in <#{COMPOUND_STATUS_CHANNEL_ID}>.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="safe", description="Mark the compound as safe")
+async def safe_cmd(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Location",
+                "This command can only be used in a server."
+            ),
+            ephemeral=True
+        )
+        return
+
+    status_channel = get_compound_status_channel(interaction.guild)
+    if status_channel is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Missing Status Channel",
+                f"I couldn't find <#{COMPOUND_STATUS_CHANNEL_ID}>."
+            ),
+            ephemeral=True
+        )
+        return
+
+    embed = discord.Embed(
+        title="✅ COMPOUND SAFE",
+        description="The compound is now safe for members.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(
+        name="Status",
+        value="Members are clear to fly in.",
+        inline=False
+    )
+    embed.set_footer(text=f"Marked safe by {interaction.user.display_name}")
+
+    await status_channel.send(embed=embed)
+    await interaction.response.send_message(
+        f"✅ Posted safe alert in <#{COMPOUND_STATUS_CHANNEL_ID}>.",
+        ephemeral=True
+    )
 
 
 # =========================
