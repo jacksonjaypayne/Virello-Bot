@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone, time
@@ -8,6 +9,9 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
+
+import gspread
+from google.oauth2.service_account import Credentials
 
 # =========================
 # CONFIG
@@ -22,14 +26,29 @@ WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
+# Google Sheets
+SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
+SHEET_NAME = "selling items"
+
+# Based on your sheet:
+# Column B = item name
+# Column D = price
+ITEM_COLUMN_INDEX = 1  # zero-based -> B
+PRICE_COLUMN_INDEX = 3  # zero-based -> D
+
 # =========================
 # LOAD ENV
 # =========================
 load_dotenv()
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 if not TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN not found")
+
+if not GOOGLE_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not found")
 
 # =========================
 # BOT SETUP
@@ -55,6 +74,46 @@ conn.commit()
 
 timer_tasks: dict[tuple[int, str], asyncio.Task] = {}
 warning_tasks: dict[tuple[int, str], asyncio.Task] = {}
+
+# =========================
+# GOOGLE SHEETS
+# =========================
+def get_gspread_client() -> gspread.Client:
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+
+    creds = Credentials.from_service_account_info(
+        service_account_info,
+        scopes=scopes
+    )
+    return gspread.authorize(creds)
+
+
+def read_price_list() -> list[tuple[str, str]]:
+    """
+    Reads the 'selling items' sheet and returns a list of (item, price).
+    Only includes rows where both item and price exist.
+    """
+    client = get_gspread_client()
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    worksheet = spreadsheet.worksheet(SHEET_NAME)
+
+    rows = worksheet.get_all_values()
+    items: list[tuple[str, str]] = []
+
+    for row in rows[1:]:  # skip header row
+        item = row[ITEM_COLUMN_INDEX].strip() if len(row) > ITEM_COLUMN_INDEX else ""
+        price = row[PRICE_COLUMN_INDEX].strip() if len(row) > PRICE_COLUMN_INDEX else ""
+
+        if item and price:
+            items.append((item, price))
+
+    return items
+
+
+async def get_price_list() -> list[tuple[str, str]]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, read_price_list)
 
 # =========================
 # HELPERS
@@ -162,6 +221,59 @@ async def ensure_guild_and_timer_channel(
     return interaction.guild, timer_channel
 
 
+def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
+    embeds: list[discord.Embed] = []
+
+    if not items:
+        embed = discord.Embed(
+            title="📋 Price List",
+            description="No priced items were found in the sheet.",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text="Source: Google Sheets")
+        return [embed]
+
+    lines = [f"**{item}** — {price}" for item, price in items]
+
+    current_chunk: list[str] = []
+    current_length = 0
+    max_description_length = 3800
+
+    for line in lines:
+        line_length = len(line) + 1
+        if current_length + line_length > max_description_length and current_chunk:
+            embed = discord.Embed(
+                title="📋 Price List" if not embeds else "📋 Price List (cont.)",
+                description="\n".join(current_chunk),
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.set_footer(text="Source: Google Sheets")
+            embeds.append(embed)
+
+            current_chunk = [line]
+            current_length = line_length
+        else:
+            current_chunk.append(line)
+            current_length += line_length
+
+    if current_chunk:
+        embed = discord.Embed(
+            title="📋 Price List" if not embeds else "📋 Price List (cont.)",
+            description="\n".join(current_chunk),
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_footer(text="Source: Google Sheets")
+        embeds.append(embed)
+
+    total = len(embeds)
+    for i, embed in enumerate(embeds, start=1):
+        embed.set_author(name=f"Page {i}/{total} • {len(items)} priced items")
+
+    return embeds
+
 # =========================
 # DAILY GANG HOURS REMINDER
 # =========================
@@ -201,7 +313,6 @@ async def gang_hours_task() -> None:
 @gang_hours_task.before_loop
 async def before_gang_hours_task() -> None:
     await bot.wait_until_ready()
-
 
 # =========================
 # TIMER TASKS
@@ -311,7 +422,6 @@ def schedule_timer_tasks(
             send_warning(guild_id, channel_id, gang, warning_time)
         )
 
-
 # =========================
 # READY EVENT
 # =========================
@@ -351,7 +461,6 @@ async def on_ready() -> None:
 
         except Exception as e:
             print(f"Failed to reload timer for {gang_name}: {e}")
-
 
 # =========================
 # COMMANDS
@@ -666,6 +775,53 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         ephemeral=True
     )
 
+
+@bot.tree.command(name="pricelist", description="Post the current selling items price list")
+async def pricelist_cmd(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Location",
+                "This command can only be used in a server text channel."
+            ),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        items = await get_price_list()
+        embeds = build_price_embeds(items)
+
+        for embed in embeds:
+            await interaction.channel.send(embed=embed)
+
+        await interaction.followup.send(
+            f"✅ Posted price list in {interaction.channel.mention}.",
+            ephemeral=True
+        )
+
+    except json.JSONDecodeError:
+        await interaction.followup.send(
+            "❌ GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.",
+            ephemeral=True
+        )
+    except gspread.exceptions.SpreadsheetNotFound:
+        await interaction.followup.send(
+            "❌ Spreadsheet not found. Check the spreadsheet ID and make sure the sheet is shared with the service account email.",
+            ephemeral=True
+        )
+    except gspread.exceptions.WorksheetNotFound:
+        await interaction.followup.send(
+            f"❌ Worksheet `{SHEET_NAME}` was not found. Check the tab name exactly.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Failed to read the price list: {e}",
+            ephemeral=True
+        )
 
 # =========================
 # RUN
