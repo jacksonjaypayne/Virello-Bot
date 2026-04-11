@@ -16,11 +16,16 @@ from google.oauth2.service_account import Credentials
 # =========================
 # CONFIG
 # =========================
-GUILD_ID = 1391768913632559296
+PRIVATE_GUILD_ID = 1391768913632559296
+PUBLIC_GUILD_ID = 1360621902674006176
+ALLOWED_GUILD_IDS = [PRIVATE_GUILD_ID, PUBLIC_GUILD_ID]
+
 TIMER_CHANNEL_ID = 1490304994975416451
 DAILY_POST_CHANNEL_ID = 1391768914106777724
 MEMBER_ROLE_ID = 1430004675762983073
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
+
+PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
 WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
@@ -30,11 +35,9 @@ SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
 SHEET_NAME = "selling items"
 
-# Based on your sheet:
-# Column B = item name
-# Column D = price
-ITEM_COLUMN_INDEX = 1  # zero-based -> B
-PRICE_COLUMN_INDEX = 3  # zero-based -> D
+# Column B = item name, Column D = price
+ITEM_COLUMN_INDEX = 1
+PRICE_COLUMN_INDEX = 3
 
 # =========================
 # LOAD ENV
@@ -90,10 +93,6 @@ def get_gspread_client() -> gspread.Client:
 
 
 def read_price_list() -> list[tuple[str, str]]:
-    """
-    Reads the 'selling items' sheet and returns a list of (item, price).
-    Only includes rows where both item and price exist.
-    """
     client = get_gspread_client()
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     worksheet = spreadsheet.worksheet(SHEET_NAME)
@@ -101,7 +100,7 @@ def read_price_list() -> list[tuple[str, str]]:
     rows = worksheet.get_all_values()
     items: list[tuple[str, str]] = []
 
-    for row in rows[1:]:  # skip header row
+    for row in rows[1:]:
         item = row[ITEM_COLUMN_INDEX].strip() if len(row) > ITEM_COLUMN_INDEX else ""
         price = row[PRICE_COLUMN_INDEX].strip() if len(row) > PRICE_COLUMN_INDEX else ""
 
@@ -179,12 +178,50 @@ def get_compound_status_channel(guild: discord.Guild) -> discord.TextChannel | N
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
+def is_private_guild(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and interaction.guild.id == PRIVATE_GUILD_ID
+
+
+def is_public_price_channel(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    if interaction.guild.id != PUBLIC_GUILD_ID:
+        return False
+    if not isinstance(interaction.channel, discord.TextChannel):
+        return False
+    return interaction.channel.category_id == PUBLIC_PRICE_CATEGORY_ID
+
+
 def make_error_embed(title: str, description: str) -> discord.Embed:
     return discord.Embed(
         title=title,
         description=description,
         color=discord.Color.red()
     )
+
+
+async def ensure_private_guild(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Location",
+                "This command can only be used in a server."
+            ),
+            ephemeral=True
+        )
+        return False
+
+    if interaction.guild.id != PRIVATE_GUILD_ID:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Command Not Allowed Here",
+                "This command can only be used in the private server."
+            ),
+            ephemeral=True
+        )
+        return False
+
+    return True
 
 
 async def acknowledge_redirect(interaction: discord.Interaction, action_text: str) -> None:
@@ -194,17 +231,10 @@ async def acknowledge_redirect(interaction: discord.Interaction, action_text: st
     )
 
 
-async def ensure_guild_and_timer_channel(
+async def ensure_private_guild_and_timer_channel(
     interaction: discord.Interaction,
 ) -> tuple[discord.Guild | None, discord.TextChannel | None]:
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            embed=make_error_embed(
-                "❌ Invalid Location",
-                "This command can only be used in a server."
-            ),
-            ephemeral=True
-        )
+    if not await ensure_private_guild(interaction):
         return None, None
 
     timer_channel = get_timer_channel(interaction.guild)
@@ -284,7 +314,7 @@ async def gang_hours_task() -> None:
     if now.weekday() >= 5:
         return
 
-    guild = bot.get_guild(GUILD_ID)
+    guild = bot.get_guild(PRIVATE_GUILD_ID)
     if guild is None:
         return
 
@@ -430,11 +460,12 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user}")
 
     try:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.clear_commands(guild=guild)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} commands: {[c.name for c in synced]}")
+        for guild_id in ALLOWED_GUILD_IDS:
+            guild = discord.Object(id=guild_id)
+            bot.tree.clear_commands(guild=guild)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} commands to guild {guild_id}: {[c.name for c in synced]}")
     except Exception as e:
         print(f"Sync error: {e}")
 
@@ -463,7 +494,7 @@ async def on_ready() -> None:
             print(f"Failed to reload timer for {gang_name}: {e}")
 
 # =========================
-# COMMANDS
+# COMMANDS - PRIVATE ONLY
 # =========================
 @bot.tree.command(name="time", description="Start cooldown")
 @app_commands.describe(
@@ -475,7 +506,7 @@ async def time_cmd(
     gang: str,
     duration: str = DEFAULT_DURATION,
 ) -> None:
-    guild, timer_channel = await ensure_guild_and_timer_channel(interaction)
+    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
     if guild is None or timer_channel is None:
         return
 
@@ -546,7 +577,7 @@ async def time_cmd(
 @bot.tree.command(name="timecheck", description="Check timer")
 @app_commands.describe(gang="Gang name")
 async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
-    guild, timer_channel = await ensure_guild_and_timer_channel(interaction)
+    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
     if guild is None or timer_channel is None:
         return
 
@@ -596,7 +627,7 @@ async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
 @bot.tree.command(name="timecancel", description="Cancel timer")
 @app_commands.describe(gang="Gang name")
 async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
-    guild, timer_channel = await ensure_guild_and_timer_channel(interaction)
+    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
     if guild is None or timer_channel is None:
         return
 
@@ -647,7 +678,7 @@ async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
 
 @bot.tree.command(name="timelist", description="Show all timers")
 async def timelist_cmd(interaction: discord.Interaction) -> None:
-    guild, timer_channel = await ensure_guild_and_timer_channel(interaction)
+    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
     if guild is None or timer_channel is None:
         return
 
@@ -692,14 +723,7 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="unsafe", description="Mark the compound as unsafe")
 async def unsafe_cmd(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            embed=make_error_embed(
-                "❌ Invalid Location",
-                "This command can only be used in a server."
-            ),
-            ephemeral=True
-        )
+    if not await ensure_private_guild(interaction):
         return
 
     status_channel = get_compound_status_channel(interaction.guild)
@@ -735,14 +759,7 @@ async def unsafe_cmd(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(name="safe", description="Mark the compound as safe")
 async def safe_cmd(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message(
-            embed=make_error_embed(
-                "❌ Invalid Location",
-                "This command can only be used in a server."
-            ),
-            ephemeral=True
-        )
+    if not await ensure_private_guild(interaction):
         return
 
     status_channel = get_compound_status_channel(interaction.guild)
@@ -775,7 +792,9 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         ephemeral=True
     )
 
-
+# =========================
+# COMMANDS - PUBLIC ONLY
+# =========================
 @bot.tree.command(name="pricelist", description="Post the current selling items price list")
 async def pricelist_cmd(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
@@ -783,6 +802,16 @@ async def pricelist_cmd(interaction: discord.Interaction) -> None:
             embed=make_error_embed(
                 "❌ Invalid Location",
                 "This command can only be used in a server text channel."
+            ),
+            ephemeral=True
+        )
+        return
+
+    if not is_public_price_channel(interaction):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Command Not Allowed Here",
+                "The `/pricelist` command can only be used in the public server inside the allowed category."
             ),
             ephemeral=True
         )
