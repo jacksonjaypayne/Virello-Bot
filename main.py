@@ -3,6 +3,7 @@ import json
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -26,6 +27,7 @@ PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
 WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
+SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 # Google Sheets
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
@@ -583,19 +585,22 @@ async def grace_cmd(
         )
         return
 
-    now = datetime.now(timezone.utc)
+    now_sydney = datetime.now(SYDNEY_TZ)
 
-    start_datetime = now.replace(
+    start_datetime_sydney = now_sydney.replace(
         hour=parsed_start.hour,
         minute=parsed_start.minute,
         second=0,
         microsecond=0
     )
 
-    if start_datetime < now:
-        start_datetime += timedelta(days=1)
+    if start_datetime_sydney < now_sydney:
+        start_datetime_sydney += timedelta(days=1)
 
-    end_datetime = start_datetime + delta
+    end_datetime_sydney = start_datetime_sydney + delta
+
+    start_datetime = start_datetime_sydney.astimezone(timezone.utc)
+    end_datetime = end_datetime_sydney.astimezone(timezone.utc)
 
     cursor.execute(
         "DELETE FROM grace_timers WHERE guild_id=? AND gang_name=?",
