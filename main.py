@@ -69,6 +69,17 @@ CREATE TABLE IF NOT EXISTS timers (
     channel_id INTEGER NOT NULL
 )
 """)
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS grace_timers (
+    guild_id INTEGER NOT NULL,
+    gang_name TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    channel_id INTEGER NOT NULL
+)
+""")
+
 conn.commit()
 
 timer_tasks: dict[tuple[int, str], asyncio.Task] = {}
@@ -154,6 +165,7 @@ def parse_db_time(end_time_str: str) -> datetime:
 
 def format_remaining(td: timedelta) -> str:
     total_seconds = max(0, int(td.total_seconds()))
+
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
@@ -315,12 +327,10 @@ async def send_warning(
         await discord.utils.sleep_until(warning_time)
 
         guild = bot.get_guild(guild_id)
-
         if guild is None:
             return
 
         channel = guild.get_channel(channel_id)
-
         if not isinstance(channel, discord.TextChannel):
             return
 
@@ -332,7 +342,6 @@ async def send_warning(
             color=discord.Color.orange(),
             timestamp=datetime.now(timezone.utc)
         )
-
         embed.add_field(name="Time Remaining", value=f"{WARNING_MINUTES} minutes", inline=True)
         embed.add_field(name="Finishes", value=format_discord_time(end_time), inline=True)
         embed.set_footer(text="Cooldown alert")
@@ -341,10 +350,8 @@ async def send_warning(
 
     except asyncio.CancelledError:
         pass
-
     except Exception as e:
         print(f"Warning task error for {gang}: {e}")
-
     finally:
         warning_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -359,12 +366,10 @@ async def finish_timer(
         await discord.utils.sleep_until(end_time)
 
         guild = bot.get_guild(guild_id)
-
         if guild is None:
             return
 
         channel = guild.get_channel(channel_id)
-
         if isinstance(channel, discord.TextChannel):
             embed = discord.Embed(
                 title="⏰ Cooldown Finished",
@@ -372,7 +377,6 @@ async def finish_timer(
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
-
             embed.add_field(name="Finished At", value=format_discord_time(end_time), inline=False)
             embed.set_footer(text="Cooldown complete")
 
@@ -386,10 +390,8 @@ async def finish_timer(
 
     except asyncio.CancelledError:
         pass
-
     except Exception as e:
         print(f"Finish timer error for {gang}: {e}")
-
     finally:
         timer_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -403,12 +405,10 @@ def schedule_timer_tasks(
     key = timer_key(guild_id, gang)
 
     old_timer = timer_tasks.get(key)
-
     if old_timer and not old_timer.done():
         old_timer.cancel()
 
     old_warning = warning_tasks.get(key)
-
     if old_warning and not old_warning.done():
         old_warning.cancel()
 
@@ -433,17 +433,10 @@ async def on_ready() -> None:
     try:
         for guild_id in ALLOWED_GUILD_IDS:
             guild = discord.Object(id=guild_id)
-
             bot.tree.clear_commands(guild=guild)
             bot.tree.copy_global_to(guild=guild)
-
             synced = await bot.tree.sync(guild=guild)
-
-            print(
-                f"Synced {len(synced)} commands to guild {guild_id}: "
-                f"{[c.name for c in synced]}"
-            )
-
+            print(f"Synced {len(synced)} commands to guild {guild_id}: {[c.name for c in synced]}")
     except Exception as e:
         print(f"Sync error: {e}")
 
@@ -490,7 +483,6 @@ async def time_cmd(
 
     try:
         delta = parse_duration(duration)
-
     except ValueError as e:
         await interaction.response.send_message(
             embed=make_error_embed("❌ Invalid Duration", str(e)),
@@ -568,9 +560,10 @@ async def grace_cmd(
     if guild is None or timer_channel is None:
         return
 
+    gang = gang.strip()
+
     try:
         delta = parse_duration(duration)
-
     except ValueError as e:
         await interaction.response.send_message(
             embed=make_error_embed("❌ Invalid Duration", str(e)),
@@ -580,7 +573,6 @@ async def grace_cmd(
 
     try:
         parsed_start = datetime.strptime(start_time.upper(), "%I:%M%p")
-
     except ValueError:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -600,7 +592,31 @@ async def grace_cmd(
         microsecond=0
     )
 
+    if start_datetime < now:
+        start_datetime += timedelta(days=1)
+
     end_datetime = start_datetime + delta
+
+    cursor.execute(
+        "DELETE FROM grace_timers WHERE guild_id=? AND gang_name=?",
+        (guild.id, gang.lower())
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO grace_timers
+        (guild_id, gang_name, start_time, end_time, channel_id)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            guild.id,
+            gang.lower(),
+            start_datetime.isoformat(),
+            end_datetime.isoformat(),
+            TIMER_CHANNEL_ID
+        )
+    )
+    conn.commit()
 
     embed = discord.Embed(
         title="✅ Grace Started",
@@ -608,12 +624,10 @@ async def grace_cmd(
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
-
     embed.add_field(name="Duration", value=duration, inline=True)
     embed.add_field(name="Warning", value="No warning", inline=True)
     embed.add_field(name="Starts", value=format_discord_time(start_datetime), inline=False)
     embed.add_field(name="Ends", value=format_discord_time(end_datetime), inline=False)
-
     embed.set_footer(text=f"Started by {interaction.user.display_name}")
 
     await timer_channel.send(embed=embed)
@@ -735,38 +749,77 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
     if guild is None or timer_channel is None:
         return
 
-    cursor.execute(
-        "SELECT gang_name, end_time FROM timers WHERE guild_id=? ORDER BY end_time ASC",
-        (guild.id,)
-    )
-    rows = cursor.fetchall()
-
     now = datetime.now(timezone.utc)
+
     embed = discord.Embed(
-        title="⏳ Active Cooldowns",
-        description="Current cooldown timers in this server.",
+        title="⏳ Active Timers",
+        description="Current cooldown and grace timers in this server.",
         color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc)
     )
 
     active_found = False
 
-    for gang_name, end_time_str in rows:
+    cursor.execute(
+        "SELECT gang_name, end_time FROM timers WHERE guild_id=? ORDER BY end_time ASC",
+        (guild.id,)
+    )
+    cooldown_rows = cursor.fetchall()
+
+    for gang_name, end_time_str in cooldown_rows:
         end_time = parse_db_time(end_time_str)
         remaining = end_time - now
 
         if remaining.total_seconds() > 0:
             active_found = True
             embed.add_field(
-                name=gang_name.capitalize(),
-                value=f"Remaining: **{format_remaining(remaining)}**\nEnds: {format_discord_time(end_time)}",
+                name=f"Cooldown — {gang_name.capitalize()}",
+                value=(
+                    f"Remaining: **{format_remaining(remaining)}**\n"
+                    f"Ends: {format_discord_time(end_time)}"
+                ),
                 inline=False
             )
+        else:
+            cursor.execute(
+                "DELETE FROM timers WHERE guild_id=? AND gang_name=?",
+                (guild.id, gang_name.lower())
+            )
+            conn.commit()
+
+    cursor.execute(
+        "SELECT gang_name, start_time, end_time FROM grace_timers WHERE guild_id=? ORDER BY end_time ASC",
+        (guild.id,)
+    )
+    grace_rows = cursor.fetchall()
+
+    for gang_name, start_time_str, end_time_str in grace_rows:
+        start_time_dt = parse_db_time(start_time_str)
+        end_time = parse_db_time(end_time_str)
+        remaining = end_time - now
+
+        if remaining.total_seconds() > 0:
+            active_found = True
+            embed.add_field(
+                name=f"Grace — {gang_name.capitalize()}",
+                value=(
+                    f"Starts: {format_discord_time(start_time_dt)}\n"
+                    f"Remaining: **{format_remaining(remaining)}**\n"
+                    f"Ends: {format_discord_time(end_time)}"
+                ),
+                inline=False
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM grace_timers WHERE guild_id=? AND gang_name=?",
+                (guild.id, gang_name.lower())
+            )
+            conn.commit()
 
     if not active_found:
         embed = discord.Embed(
             title="📭 No Active Timers",
-            description="There are currently no cooldowns running.",
+            description="There are currently no cooldowns or grace timers running.",
             color=discord.Color.light_grey()
         )
 
