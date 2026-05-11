@@ -2,11 +2,10 @@ import os
 import json
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta, timezone, time
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -21,15 +20,12 @@ PUBLIC_GUILD_ID = 1360621902674006176
 ALLOWED_GUILD_IDS = [PRIVATE_GUILD_ID, PUBLIC_GUILD_ID]
 
 TIMER_CHANNEL_ID = 1490304994975416451
-DAILY_POST_CHANNEL_ID = 1391768914106777724
-MEMBER_ROLE_ID = 1430004675762983073
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
 
 PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
 WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
-SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 # Google Sheets
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
@@ -89,6 +85,7 @@ def get_gspread_client() -> gspread.Client:
         service_account_info,
         scopes=scopes
     )
+
     return gspread.authorize(creds)
 
 
@@ -119,6 +116,7 @@ async def get_price_list() -> list[tuple[str, str]]:
 # =========================
 def parse_duration(duration: str) -> timedelta:
     parts = duration.split(":")
+
     if len(parts) != 3:
         raise ValueError("Use HH:MM:SS format, for example 01:00:00.")
 
@@ -147,8 +145,10 @@ def timer_key(guild_id: int, gang: str) -> tuple[int, str]:
 
 def parse_db_time(end_time_str: str) -> datetime:
     dt = datetime.fromisoformat(end_time_str)
+
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
+
     return dt
 
 
@@ -156,6 +156,7 @@ def format_remaining(td: timedelta) -> str:
     total_seconds = max(0, int(td.total_seconds()))
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
+
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
@@ -168,27 +169,21 @@ def get_timer_channel(guild: discord.Guild) -> discord.TextChannel | None:
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-def get_daily_post_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    channel = guild.get_channel(DAILY_POST_CHANNEL_ID)
-    return channel if isinstance(channel, discord.TextChannel) else None
-
-
 def get_compound_status_channel(guild: discord.Guild) -> discord.TextChannel | None:
     channel = guild.get_channel(COMPOUND_STATUS_CHANNEL_ID)
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
-def is_private_guild(interaction: discord.Interaction) -> bool:
-    return interaction.guild is not None and interaction.guild.id == PRIVATE_GUILD_ID
-
-
 def is_public_price_channel(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
         return False
+
     if interaction.guild.id != PUBLIC_GUILD_ID:
         return False
+
     if not isinstance(interaction.channel, discord.TextChannel):
         return False
+
     return interaction.channel.category_id == PUBLIC_PRICE_CATEGORY_ID
 
 
@@ -238,6 +233,7 @@ async def ensure_private_guild_and_timer_channel(
         return None, None
 
     timer_channel = get_timer_channel(interaction.guild)
+
     if timer_channel is None:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -272,6 +268,7 @@ def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
 
     for line in lines:
         line_length = len(line) + 1
+
         if current_length + line_length > max_description_length and current_chunk:
             embed = discord.Embed(
                 title="📋 Price List" if not embeds else "📋 Price List (cont.)",
@@ -299,6 +296,7 @@ def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
         embeds.append(embed)
 
     total = len(embeds)
+
     for i, embed in enumerate(embeds, start=1):
         embed.set_author(name=f"Page {i}/{total} • {len(items)} priced items")
 
@@ -317,10 +315,12 @@ async def send_warning(
         await discord.utils.sleep_until(warning_time)
 
         guild = bot.get_guild(guild_id)
+
         if guild is None:
             return
 
         channel = guild.get_channel(channel_id)
+
         if not isinstance(channel, discord.TextChannel):
             return
 
@@ -332,6 +332,7 @@ async def send_warning(
             color=discord.Color.orange(),
             timestamp=datetime.now(timezone.utc)
         )
+
         embed.add_field(name="Time Remaining", value=f"{WARNING_MINUTES} minutes", inline=True)
         embed.add_field(name="Finishes", value=format_discord_time(end_time), inline=True)
         embed.set_footer(text="Cooldown alert")
@@ -340,8 +341,10 @@ async def send_warning(
 
     except asyncio.CancelledError:
         pass
+
     except Exception as e:
         print(f"Warning task error for {gang}: {e}")
+
     finally:
         warning_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -356,10 +359,12 @@ async def finish_timer(
         await discord.utils.sleep_until(end_time)
 
         guild = bot.get_guild(guild_id)
+
         if guild is None:
             return
 
         channel = guild.get_channel(channel_id)
+
         if isinstance(channel, discord.TextChannel):
             embed = discord.Embed(
                 title="⏰ Cooldown Finished",
@@ -367,6 +372,7 @@ async def finish_timer(
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
+
             embed.add_field(name="Finished At", value=format_discord_time(end_time), inline=False)
             embed.set_footer(text="Cooldown complete")
 
@@ -380,8 +386,10 @@ async def finish_timer(
 
     except asyncio.CancelledError:
         pass
+
     except Exception as e:
         print(f"Finish timer error for {gang}: {e}")
+
     finally:
         timer_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -395,10 +403,12 @@ def schedule_timer_tasks(
     key = timer_key(guild_id, gang)
 
     old_timer = timer_tasks.get(key)
+
     if old_timer and not old_timer.done():
         old_timer.cancel()
 
     old_warning = warning_tasks.get(key)
+
     if old_warning and not old_warning.done():
         old_warning.cancel()
 
@@ -407,6 +417,7 @@ def schedule_timer_tasks(
     )
 
     warning_time = end_time - timedelta(minutes=WARNING_MINUTES)
+
     if warning_time > datetime.now(timezone.utc):
         warning_tasks[key] = asyncio.create_task(
             send_warning(guild_id, channel_id, gang, warning_time)
@@ -422,10 +433,17 @@ async def on_ready() -> None:
     try:
         for guild_id in ALLOWED_GUILD_IDS:
             guild = discord.Object(id=guild_id)
+
             bot.tree.clear_commands(guild=guild)
             bot.tree.copy_global_to(guild=guild)
+
             synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} commands to guild {guild_id}: {[c.name for c in synced]}")
+
+            print(
+                f"Synced {len(synced)} commands to guild {guild_id}: "
+                f"{[c.name for c in synced]}"
+            )
+
     except Exception as e:
         print(f"Sync error: {e}")
 
@@ -464,6 +482,7 @@ async def time_cmd(
     duration: str = DEFAULT_DURATION,
 ) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+
     if guild is None or timer_channel is None:
         return
 
@@ -471,6 +490,7 @@ async def time_cmd(
 
     try:
         delta = parse_duration(duration)
+
     except ValueError as e:
         await interaction.response.send_message(
             embed=make_error_embed("❌ Invalid Duration", str(e)),
@@ -531,10 +551,84 @@ async def time_cmd(
     await acknowledge_redirect(interaction, "Posted cooldown")
 
 
+@bot.tree.command(name="grace", description="Start a grace timer")
+@app_commands.describe(
+    gang="Gang name",
+    start_time="Example: 7:00PM",
+    duration="HH:MM:SS format"
+)
+async def grace_cmd(
+    interaction: discord.Interaction,
+    gang: str,
+    start_time: str,
+    duration: str
+) -> None:
+    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+
+    if guild is None or timer_channel is None:
+        return
+
+    try:
+        delta = parse_duration(duration)
+
+    except ValueError as e:
+        await interaction.response.send_message(
+            embed=make_error_embed("❌ Invalid Duration", str(e)),
+            ephemeral=True
+        )
+        return
+
+    try:
+        parsed_start = datetime.strptime(start_time.upper(), "%I:%M%p")
+
+    except ValueError:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Start Time",
+                "Use format like `7:00PM` or `11:30AM`."
+            ),
+            ephemeral=True
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+
+    start_datetime = now.replace(
+        hour=parsed_start.hour,
+        minute=parsed_start.minute,
+        second=0,
+        microsecond=0
+    )
+
+    end_datetime = start_datetime + delta
+
+    embed = discord.Embed(
+        title="✅ Grace Started",
+        description=f"Grace period started for **{gang}**.",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    embed.add_field(name="Duration", value=duration, inline=True)
+    embed.add_field(name="Warning", value="No warning", inline=True)
+    embed.add_field(name="Starts", value=format_discord_time(start_datetime), inline=False)
+    embed.add_field(name="Ends", value=format_discord_time(end_datetime), inline=False)
+
+    embed.set_footer(text=f"Started by {interaction.user.display_name}")
+
+    await timer_channel.send(embed=embed)
+
+    await interaction.response.send_message(
+        f"✅ Posted grace timer for **{gang}** in <#{TIMER_CHANNEL_ID}>.",
+        ephemeral=True
+    )
+
+
 @bot.tree.command(name="timecheck", description="Check timer")
 @app_commands.describe(gang="Gang name")
 async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+
     if guild is None or timer_channel is None:
         return
 
@@ -585,6 +679,7 @@ async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
 @app_commands.describe(gang="Gang name")
 async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+
     if guild is None or timer_channel is None:
         return
 
@@ -636,6 +731,7 @@ async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
 @bot.tree.command(name="timelist", description="Show all timers")
 async def timelist_cmd(interaction: discord.Interaction) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+
     if guild is None or timer_channel is None:
         return
 
@@ -684,6 +780,7 @@ async def unsafe_cmd(interaction: discord.Interaction) -> None:
         return
 
     status_channel = get_compound_status_channel(interaction.guild)
+
     if status_channel is None:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -720,6 +817,7 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         return
 
     status_channel = get_compound_status_channel(interaction.guild)
+
     if status_channel is None:
         await interaction.response.send_message(
             embed=make_error_embed(
@@ -793,16 +891,19 @@ async def pricelist_cmd(interaction: discord.Interaction) -> None:
             "❌ GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.",
             ephemeral=True
         )
+
     except gspread.exceptions.SpreadsheetNotFound:
         await interaction.followup.send(
             "❌ Spreadsheet not found. Check the spreadsheet ID and make sure the sheet is shared with the service account email.",
             ephemeral=True
         )
+
     except gspread.exceptions.WorksheetNotFound:
         await interaction.followup.send(
             f"❌ Worksheet `{SHEET_NAME}` was not found. Check the tab name exactly.",
             ephemeral=True
         )
+
     except Exception as e:
         await interaction.followup.send(
             f"❌ Failed to read the price list: {e}",
