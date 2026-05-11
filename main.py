@@ -305,46 +305,6 @@ def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
     return embeds
 
 # =========================
-# DAILY GANG HOURS REMINDER
-# =========================
-@tasks.loop(time=time(hour=19, minute=0, tzinfo=SYDNEY_TZ))
-async def gang_hours_task() -> None:
-    now = datetime.now(SYDNEY_TZ)
-
-    if now.weekday() >= 5:
-        return
-
-    guild = bot.get_guild(PRIVATE_GUILD_ID)
-    if guild is None:
-        return
-
-    channel = get_daily_post_channel(guild)
-    role = guild.get_role(MEMBER_ROLE_ID)
-
-    if channel is None or role is None:
-        return
-
-    embed = discord.Embed(
-        title="🔥 Gang Hours Started",
-        description="Gang hours have now started.",
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.add_field(
-        name="Status",
-        value="Gang hours are active.",
-        inline=False
-    )
-    embed.set_footer(text="Virello Operations")
-
-    await channel.send(content=role.mention, embed=embed)
-
-
-@gang_hours_task.before_loop
-async def before_gang_hours_task() -> None:
-    await bot.wait_until_ready()
-
-# =========================
 # TIMER TASKS
 # =========================
 async def send_warning(
@@ -468,9 +428,6 @@ async def on_ready() -> None:
             print(f"Synced {len(synced)} commands to guild {guild_id}: {[c.name for c in synced]}")
     except Exception as e:
         print(f"Sync error: {e}")
-
-    if not gang_hours_task.is_running():
-        gang_hours_task.start()
 
     cursor.execute("SELECT guild_id, gang_name, end_time, channel_id FROM timers")
     rows = cursor.fetchall()
