@@ -31,7 +31,7 @@ SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 # Google Sheets
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
-SHEET_NAME = "selling items"
+SHEET_NAME = "warehouse"
 
 # Column B = item name, Column D = price
 ITEM_COLUMN_INDEX = 1
