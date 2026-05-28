@@ -30,11 +30,10 @@ WARNING_MINUTES = 5
 DEFAULT_DURATION = "01:00:00"
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
-# Google Sheets
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
 SHEET_NAME = "warehouse"
 
-# Column B = item name, Column D = price
+# Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
 PRICE_COLUMN_INDEX = 3
 
@@ -910,16 +909,35 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         ephemeral=True
     )
 
-
-@bot.tree.command(name="warehousecost", description="Calculate total warehouse cost")
+# =========================
+# COMMANDS - PUBLIC ONLY
+# =========================
+@bot.tree.command(name="warehousecost", description="Calculate total warehouse sale price")
 @app_commands.describe(
     items="Example: 5 x Lock Picking Tool, 2 x Bullet Crate (5.5) x 100"
 )
 async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> None:
-    if not await ensure_private_guild(interaction):
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Invalid Location",
+                "This command can only be used in a server text channel."
+            ),
+            ephemeral=True
+        )
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not is_public_price_channel(interaction):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Command Not Allowed Here",
+                "This command can only be used in the public price category."
+            ),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
 
     try:
         price_list = await get_price_list()
@@ -940,8 +958,7 @@ async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> Non
 
             if " x " not in part.lower():
                 await interaction.followup.send(
-                    f"❌ Could not read `{part}`. Use format like `5 x Lock Picking Tool`.",
-                    ephemeral=True
+                    f"❌ Could not read `{part}`. Use format like `5 x Lock Picking Tool`."
                 )
                 return
 
@@ -951,8 +968,7 @@ async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> Non
                 quantity = int(quantity_text.strip())
             except ValueError:
                 await interaction.followup.send(
-                    f"❌ Invalid quantity in `{part}`.",
-                    ephemeral=True
+                    f"❌ Invalid quantity in `{part}`."
                 )
                 return
 
@@ -1000,35 +1016,32 @@ async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> Non
 
             lines.append(
                 f"**{quantity}x {display_name}** "
-                f"(${unit_price:,.0f} each) = **${item_total:,.0f}**"
+                f"— ${unit_price:,.0f} each = **${item_total:,.0f}**"
             )
 
         embed = discord.Embed(
-            title="📦 Warehouse Cost Calculator",
+            title="🧾 Warehouse Sale Calculator",
             description="\n".join(lines) if lines else "No items calculated.",
             color=discord.Color.blue(),
             timestamp=datetime.now(timezone.utc)
         )
 
         embed.add_field(
-            name="Total Cost",
+            name="Total Sale Price",
             value=f"**${total:,.0f}**",
             inline=False
         )
 
         embed.set_footer(text=f"Calculated by {interaction.user.display_name}")
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
     except Exception as e:
         await interaction.followup.send(
-            f"❌ Failed to calculate warehouse cost: {e}",
-            ephemeral=True
+            f"❌ Failed to calculate warehouse cost: {e}"
         )
 
-# =========================
-# COMMANDS - PUBLIC ONLY
-# =========================
+
 @bot.tree.command(name="pricelist", description="Post the current warehouse price list")
 async def pricelist_cmd(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
