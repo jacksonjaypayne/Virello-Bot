@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 import gspread
 from google.oauth2.service_account import Credentials
+from rapidfuzz import process, fuzz
 
 # =========================
 # CONFIG
@@ -167,7 +168,6 @@ def parse_db_time(end_time_str: str) -> datetime:
 
 def format_remaining(td: timedelta) -> str:
     total_seconds = max(0, int(td.total_seconds()))
-
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
 
@@ -352,8 +352,10 @@ async def send_warning(
 
     except asyncio.CancelledError:
         pass
+
     except Exception as e:
         print(f"Warning task error for {gang}: {e}")
+
     finally:
         warning_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -372,6 +374,7 @@ async def finish_timer(
             return
 
         channel = guild.get_channel(channel_id)
+
         if isinstance(channel, discord.TextChannel):
             embed = discord.Embed(
                 title="⏰ Cooldown Finished",
@@ -392,8 +395,10 @@ async def finish_timer(
 
     except asyncio.CancelledError:
         pass
+
     except Exception as e:
         print(f"Finish timer error for {gang}: {e}")
+
     finally:
         timer_tasks.pop(timer_key(guild_id, gang), None)
 
@@ -905,10 +910,126 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         ephemeral=True
     )
 
+
+@bot.tree.command(name="warehousecost", description="Calculate total warehouse cost")
+@app_commands.describe(
+    items="Example: 5 x Lock Picking Tool, 2 x Bullet Crate (5.5) x 100"
+)
+async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> None:
+    if not await ensure_private_guild(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        price_list = await get_price_list()
+
+        price_lookup = {
+            item.lower(): (item, price)
+            for item, price in price_list
+        }
+
+        requested_items = []
+        raw_parts = items.replace("\n", ",").split(",")
+
+        for part in raw_parts:
+            part = part.strip()
+
+            if not part:
+                continue
+
+            if " x " not in part.lower():
+                await interaction.followup.send(
+                    f"❌ Could not read `{part}`. Use format like `5 x Lock Picking Tool`.",
+                    ephemeral=True
+                )
+                return
+
+            quantity_text, item_name = part.split(" x ", 1)
+
+            try:
+                quantity = int(quantity_text.strip())
+            except ValueError:
+                await interaction.followup.send(
+                    f"❌ Invalid quantity in `{part}`.",
+                    ephemeral=True
+                )
+                return
+
+            requested_items.append((quantity, item_name.strip()))
+
+        total = 0
+        lines = []
+
+        for quantity, item_name in requested_items:
+            item_key = item_name.lower()
+
+            matched = process.extractOne(
+                item_key,
+                price_lookup.keys(),
+                scorer=fuzz.WRatio
+            )
+
+            if not matched:
+                lines.append(f"❌ **{item_name}** not found.")
+                continue
+
+            matched_name, score, _ = matched
+
+            if score < 70:
+                lines.append(f"❌ **{item_name}** not found.")
+                continue
+
+            display_name, price_text = price_lookup[matched_name]
+
+            clean_price = (
+                str(price_text)
+                .replace("$", "")
+                .replace(",", "")
+                .strip()
+            )
+
+            try:
+                unit_price = int(float(clean_price))
+            except ValueError:
+                lines.append(f"❌ **{display_name}** has invalid price `{price_text}`.")
+                continue
+
+            item_total = quantity * unit_price
+            total += item_total
+
+            lines.append(
+                f"**{quantity}x {display_name}** "
+                f"(${unit_price:,.0f} each) = **${item_total:,.0f}**"
+            )
+
+        embed = discord.Embed(
+            title="📦 Warehouse Cost Calculator",
+            description="\n".join(lines) if lines else "No items calculated.",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        embed.add_field(
+            name="Total Cost",
+            value=f"**${total:,.0f}**",
+            inline=False
+        )
+
+        embed.set_footer(text=f"Calculated by {interaction.user.display_name}")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Failed to calculate warehouse cost: {e}",
+            ephemeral=True
+        )
+
 # =========================
 # COMMANDS - PUBLIC ONLY
 # =========================
-@bot.tree.command(name="pricelist", description="Post the current selling items price list")
+@bot.tree.command(name="pricelist", description="Post the current warehouse price list")
 async def pricelist_cmd(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
         await interaction.response.send_message(
