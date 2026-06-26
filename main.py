@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -36,6 +36,14 @@ SHEET_NAME = "warehouse"
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
 PRICE_COLUMN_INDEX = 3
+
+# Warehouse reset columns
+# E = Item Count, I = Daily Reset Count
+WAREHOUSE_ITEM_COUNT_COLUMN = 5
+WAREHOUSE_DAILY_RESET_COLUMN = 9
+WAREHOUSE_RESET_HOUR = 2
+WAREHOUSE_RESET_MINUTE = 0
+last_warehouse_reset_date: str | None = None
 
 # =========================
 # LOAD ENV
@@ -91,7 +99,7 @@ warning_tasks: dict[tuple[int, str], asyncio.Task] = {}
 # GOOGLE SHEETS
 # =========================
 def get_gspread_client() -> gspread.Client:
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     service_account_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 
     creds = Credentials.from_service_account_info(
@@ -123,6 +131,63 @@ def read_price_list() -> list[tuple[str, str]]:
 async def get_price_list() -> list[tuple[str, str]]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, read_price_list)
+
+
+def reset_warehouse_daily_counts() -> int:
+    client = get_gspread_client()
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    worksheet = spreadsheet.worksheet(SHEET_NAME)
+
+    rows = worksheet.get_all_values()
+
+    updates = []
+    updated_count = 0
+
+    for row_num, row in enumerate(rows[1:], start=2):
+        daily_reset = (
+            row[WAREHOUSE_DAILY_RESET_COLUMN - 1].strip()
+            if len(row) >= WAREHOUSE_DAILY_RESET_COLUMN
+            else ""
+        )
+
+        if not daily_reset:
+            continue
+
+        updates.append({
+            "range": f"E{row_num}",
+            "values": [[daily_reset]]
+        })
+        updated_count += 1
+
+    if updates:
+        worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+
+    return updated_count
+
+
+async def run_warehouse_daily_reset() -> int:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, reset_warehouse_daily_counts)
+
+
+@tasks.loop(minutes=1)
+async def warehouse_daily_reset_loop() -> None:
+    global last_warehouse_reset_date
+
+    now_sydney = datetime.now(SYDNEY_TZ)
+    today_key = now_sydney.date().isoformat()
+
+    if (
+        now_sydney.hour == WAREHOUSE_RESET_HOUR
+        and now_sydney.minute == WAREHOUSE_RESET_MINUTE
+        and last_warehouse_reset_date != today_key
+    ):
+        try:
+            updated_count = await run_warehouse_daily_reset()
+            last_warehouse_reset_date = today_key
+            print(f"Daily warehouse reset complete. Rows updated: {updated_count}")
+        except Exception as e:
+            print(f"Daily warehouse reset failed: {e}")
 
 # =========================
 # HELPERS
@@ -435,6 +500,10 @@ def schedule_timer_tasks(
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user}")
+
+    if not warehouse_daily_reset_loop.is_running():
+        warehouse_daily_reset_loop.start()
+        print("Warehouse daily reset loop started.")
 
     try:
         for guild_id in ALLOWED_GUILD_IDS:
@@ -908,6 +977,28 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
         f"✅ Posted safe alert in <#{COMPOUND_STATUS_CHANNEL_ID}>.",
         ephemeral=True
     )
+
+
+@bot.tree.command(name="warehousereset", description="Manually reset warehouse daily counts")
+async def warehousereset_cmd(interaction: discord.Interaction) -> None:
+    if not await ensure_private_guild(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        updated_count = await run_warehouse_daily_reset()
+
+        await interaction.followup.send(
+            f"✅ Warehouse reset complete. Updated **{updated_count}** item counts from Daily Reset Count.",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Warehouse reset failed: {e}",
+            ephemeral=True
+        )
 
 # =========================
 # COMMANDS - PUBLIC ONLY
