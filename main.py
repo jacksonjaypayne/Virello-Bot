@@ -23,6 +23,7 @@ ALLOWED_GUILD_IDS = [PRIVATE_GUILD_ID, PUBLIC_GUILD_ID]
 
 TIMER_CHANNEL_ID = 1490304994975416451
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
+KOS_CHANNEL_ID = 1522965909256540190
 
 PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
@@ -249,6 +250,11 @@ def get_timer_channel(guild: discord.Guild) -> discord.TextChannel | None:
 
 def get_compound_status_channel(guild: discord.Guild) -> discord.TextChannel | None:
     channel = guild.get_channel(COMPOUND_STATUS_CHANNEL_ID)
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def get_kos_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    channel = guild.get_channel(KOS_CHANNEL_ID)
     return channel if isinstance(channel, discord.TextChannel) else None
 
 
@@ -975,6 +981,79 @@ async def safe_cmd(interaction: discord.Interaction) -> None:
     await status_channel.send(embed=embed)
     await interaction.response.send_message(
         f"✅ Posted safe alert in <#{COMPOUND_STATUS_CHANNEL_ID}>.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="kos", description="Post a KOS alert with optional grace")
+@app_commands.describe(
+    gang="Gang name",
+    grace="Grace until KOS starts. HH:MM:SS format. Leave blank for no grace"
+)
+async def kos_cmd(
+    interaction: discord.Interaction,
+    gang: str,
+    grace: str = "00:00:00"
+) -> None:
+    if not await ensure_private_guild(interaction):
+        return
+
+    kos_channel = get_kos_channel(interaction.guild)
+
+    if kos_channel is None:
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Missing KOS Channel",
+                f"I couldn't find <#{KOS_CHANNEL_ID}>."
+            ),
+            ephemeral=True
+        )
+        return
+
+    gang = gang.strip()
+
+    try:
+        grace_delta = (
+            timedelta(seconds=0)
+            if grace.strip() == "00:00:00"
+            else parse_duration(grace.strip())
+        )
+    except ValueError as e:
+        await interaction.response.send_message(
+            embed=make_error_embed("❌ Invalid Grace Time", str(e)),
+            ephemeral=True
+        )
+        return
+
+    starts_at = datetime.now(timezone.utc) + grace_delta
+
+    member_role = discord.utils.get(interaction.guild.roles, name="Member")
+    role_ping = member_role.mention if member_role else "@Member"
+
+    embed = discord.Embed(
+        title="🚨 KILL ON SIGHT",
+        description=f"**{gang}** has been placed on **KOS**.",
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    embed.add_field(name="Gang", value=gang, inline=False)
+
+    if grace_delta.total_seconds() > 0:
+        embed.add_field(name="Grace Until Start", value=grace.strip(), inline=True)
+        embed.add_field(name="KOS Starts", value=format_discord_time(starts_at), inline=True)
+    else:
+        embed.add_field(name="Status", value="KOS starts **now**.", inline=False)
+
+    embed.set_footer(text=f"Called by {interaction.user.display_name}")
+
+    await kos_channel.send(
+        content=role_ping,
+        embed=embed
+    )
+
+    await interaction.response.send_message(
+        f"✅ Posted KOS for **{gang}** in <#{KOS_CHANNEL_ID}>.",
         ephemeral=True
     )
 
