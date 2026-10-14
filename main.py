@@ -28,7 +28,7 @@ KOS_CHANNEL_ID = 1522965909256540190
 PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
 WARNING_MINUTES = 5
-DEFAULT_DURATION = "01:00:00"
+DEFAULT_DURATION = "02:00:00"
 SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
@@ -409,14 +409,14 @@ async def send_warning(
         end_time = warning_time + timedelta(minutes=WARNING_MINUTES)
 
         embed = discord.Embed(
-            title="⚠️ Cooldown Warning",
-            description=f"**{gang}** is almost off cooldown.",
+            title="⚠️ Breaching Warning",
+            description=f"**{gang}** can breach again soon.",
             color=discord.Color.orange(),
             timestamp=datetime.now(timezone.utc)
         )
         embed.add_field(name="Time Remaining", value=f"{WARNING_MINUTES} minutes", inline=True)
         embed.add_field(name="Finishes", value=format_discord_time(end_time), inline=True)
-        embed.set_footer(text="Cooldown alert")
+        embed.set_footer(text="Breaching cooldown alert")
 
         await channel.send(embed=embed)
 
@@ -447,13 +447,13 @@ async def finish_timer(
 
         if isinstance(channel, discord.TextChannel):
             embed = discord.Embed(
-                title="⏰ Cooldown Finished",
-                description=f"**{gang}** is now off cooldown.",
+                title="⏰ Breaching Cooldown Finished",
+                description=f"**{gang}** can now breach again.",
                 color=discord.Color.green(),
                 timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="Finished At", value=format_discord_time(end_time), inline=False)
-            embed.set_footer(text="Cooldown complete")
+            embed.set_footer(text="Breaching cooldown complete")
 
             await channel.send(embed=embed)
 
@@ -545,10 +545,10 @@ async def on_ready() -> None:
 # =========================
 # COMMANDS - PRIVATE ONLY
 # =========================
-@bot.tree.command(name="time", description="Start cooldown")
+@bot.tree.command(name="time", description="Start a breaching cooldown")
 @app_commands.describe(
     gang="Gang name",
-    duration="HH:MM:SS format. Leave blank for 1 hour"
+    duration="HH:MM:SS format. Leave blank for 2 hours"
 )
 async def time_cmd(
     interaction: discord.Interaction,
@@ -584,7 +584,7 @@ async def time_cmd(
         if remaining.total_seconds() > 0:
             embed = discord.Embed(
                 title="⚠️ Timer Already Active",
-                description=f"**{gang}** already has an active cooldown.",
+                description=f"**{gang}** already has an active breaching cooldown.",
                 color=discord.Color.orange()
             )
             embed.add_field(name="Remaining", value=format_remaining(remaining), inline=True)
@@ -610,8 +610,8 @@ async def time_cmd(
     schedule_timer_tasks(guild.id, TIMER_CHANNEL_ID, gang, end_time)
 
     embed = discord.Embed(
-        title="✅ Cooldown Started",
-        description=f"Cooldown started for **{gang}**.",
+        title="✅ Breaching Cooldown Started",
+        description=f"Breaching cooldown started for **{gang}**.",
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -621,7 +621,7 @@ async def time_cmd(
     embed.set_footer(text=f"Started by {interaction.user.display_name}")
 
     await timer_channel.send(embed=embed)
-    await acknowledge_redirect(interaction, "Posted cooldown")
+    await acknowledge_redirect(interaction, "Posted breaching cooldown")
 
 
 @bot.tree.command(name="grace", description="Start a grace timer")
@@ -722,7 +722,7 @@ async def grace_cmd(
     )
 
 
-@bot.tree.command(name="timecheck", description="Check timer")
+@bot.tree.command(name="timecheck", description="Check breaching timer")
 @app_commands.describe(gang="Gang name")
 async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
@@ -740,7 +740,7 @@ async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="📭 No Timer Found",
-                description=f"No active cooldown was found for **{gang}**.",
+                description=f"No active breaching cooldown was found for **{gang}**.",
                 color=discord.Color.light_grey()
             ),
             ephemeral=True
@@ -752,17 +752,17 @@ async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
 
     if remaining.total_seconds() <= 0:
         embed = discord.Embed(
-            title="⏰ Cooldown Finished",
-            description=f"**{gang}** is already off cooldown.",
+            title="⏰ Breaching Cooldown Finished",
+            description=f"**{gang}** can already breach again.",
             color=discord.Color.green()
         )
         await timer_channel.send(embed=embed)
-        await acknowledge_redirect(interaction, "Posted cooldown status")
+        await acknowledge_redirect(interaction, "Posted breaching cooldown status")
         return
 
     embed = discord.Embed(
-        title="⏳ Cooldown Status",
-        description=f"Current cooldown for **{gang}**.",
+        title="⏳ Breaching Cooldown Status",
+        description=f"Current breaching cooldown for **{gang}**.",
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -770,10 +770,10 @@ async def timecheck_cmd(interaction: discord.Interaction, gang: str) -> None:
     embed.add_field(name="Ends", value=format_discord_time(end_time), inline=True)
 
     await timer_channel.send(embed=embed)
-    await acknowledge_redirect(interaction, "Posted cooldown status")
+    await acknowledge_redirect(interaction, "Posted breaching cooldown status")
 
 
-@bot.tree.command(name="timecancel", description="Cancel timer")
+@bot.tree.command(name="timecancel", description="Cancel breaching timer")
 @app_commands.describe(gang="Gang name")
 async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
     guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
@@ -791,7 +791,7 @@ async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
         await interaction.response.send_message(
             embed=discord.Embed(
                 title="📭 No Timer Found",
-                description=f"No active cooldown was found for **{gang}**.",
+                description=f"No active breaching cooldown was found for **{gang}**.",
                 color=discord.Color.light_grey()
             ),
             ephemeral=True
@@ -815,8 +815,8 @@ async def timecancel_cmd(interaction: discord.Interaction, gang: str) -> None:
     conn.commit()
 
     embed = discord.Embed(
-        title="🛑 Cooldown Cancelled",
-        description=f"Cooldown for **{gang}** has been cancelled.",
+        title="🛑 Breaching Cooldown Cancelled",
+        description=f"Breaching cooldown for **{gang}** has been cancelled.",
         color=discord.Color.red(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -837,7 +837,7 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
 
     embed = discord.Embed(
         title="⏳ Active Timers",
-        description="Current cooldown and grace timers in this server.",
+        description="Current breaching cooldown and grace timers in this server.",
         color=discord.Color.green(),
         timestamp=datetime.now(timezone.utc)
     )
@@ -857,7 +857,7 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
         if remaining.total_seconds() > 0:
             active_found = True
             embed.add_field(
-                name=f"Cooldown — {gang_name.capitalize()}",
+                name=f"Breaching — {gang_name.capitalize()}",
                 value=(
                     f"Remaining: **{format_remaining(remaining)}**\n"
                     f"Ends: {format_discord_time(end_time)}"
@@ -903,7 +903,7 @@ async def timelist_cmd(interaction: discord.Interaction) -> None:
     if not active_found:
         embed = discord.Embed(
             title="📭 No Active Timers",
-            description="There are currently no cooldowns or grace timers running.",
+            description="There are currently no breaching cooldowns or grace timers running.",
             color=discord.Color.light_grey()
         )
 
