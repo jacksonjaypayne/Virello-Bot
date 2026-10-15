@@ -530,16 +530,18 @@ async def on_ready() -> None:
         print("Warehouse daily reset loop started.")
 
     try:
-        # Register one global version of each command.
+        # Keep all standard commands global, but register EV availability
+        # directly in the private guild for immediate visibility.
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} global commands: {[c.name for c in synced]}")
 
-        # Remove older server-specific copies to prevent duplicate /time entries.
         for guild_id in ALLOWED_GUILD_IDS:
             guild = discord.Object(id=guild_id)
             bot.tree.clear_commands(guild=guild)
-            await bot.tree.sync(guild=guild)
-            print(f"Cleared duplicate guild commands for {guild_id}")
+            if guild_id == PRIVATE_GUILD_ID:
+                bot.tree.add_command(evavailable_cmd, guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
     except Exception as e:
         print(f"Sync error: {e}")
 
@@ -1259,6 +1261,7 @@ async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> Non
 
 
 @bot.tree.command(name="evavailable", description="Set EV price list availability (Leadership only)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 @app_commands.describe(available="Allow public /pricelist access?")
 @app_commands.choices(available=[
     app_commands.Choice(name="Yes", value="yes"),
