@@ -1299,7 +1299,7 @@ async def evavailable_cmd(
         title="✅ EV Available" if enabled else "🔴 EV Unavailable",
         description=(
             "The public Discord can now use `/pricelist`." if enabled
-            else "The public Discord will now receive: **EV is currently unavailable**."
+            else "**EV is currently unavailable**."
         ),
         color=discord.Color.green() if enabled else discord.Color.red(),
         timestamp=datetime.now(timezone.utc)
@@ -1335,7 +1335,7 @@ async def pricelist_cmd(interaction: discord.Interaction) -> None:
     if not is_ev_available():
         embed = discord.Embed(
             title="🔴 EV Unavailable",
-            description="The public Discord will now receive: **EV is currently unavailable**.",
+            description="**EV is currently unavailable**.",
             color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc)
         )
