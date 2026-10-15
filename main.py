@@ -1305,7 +1305,9 @@ async def evavailable_cmd(
         timestamp=datetime.now(timezone.utc)
     )
     embed.set_footer(text=f"Updated by {member.display_name}")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.send(embed=embed)
+    await interaction.followup.send("✅ EV availability announcement posted in this channel.", ephemeral=True)
 
 
 @bot.tree.command(name="pricelist", description="Post the current warehouse price list")
@@ -1331,10 +1333,14 @@ async def pricelist_cmd(interaction: discord.Interaction) -> None:
         return
 
     if not is_ev_available():
-        await interaction.response.send_message(
-            "EV is currently unavailable",
-            ephemeral=True
+        embed = discord.Embed(
+            title="🔴 EV Unavailable",
+            description="The public Discord will now receive: **EV is currently unavailable**.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
         )
+        embed.set_footer(text="EV availability status")
+        await interaction.response.send_message(embed=embed)
         return
 
     await interaction.response.defer(ephemeral=True)
