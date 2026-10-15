@@ -512,12 +512,16 @@ async def on_ready() -> None:
         print("Warehouse daily reset loop started.")
 
     try:
+        # Register one global version of each command.
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} global commands: {[c.name for c in synced]}")
+
+        # Remove older server-specific copies to prevent duplicate /time entries.
         for guild_id in ALLOWED_GUILD_IDS:
             guild = discord.Object(id=guild_id)
             bot.tree.clear_commands(guild=guild)
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
-            print(f"Synced {len(synced)} commands to guild {guild_id}: {[c.name for c in synced]}")
+            await bot.tree.sync(guild=guild)
+            print(f"Cleared duplicate guild commands for {guild_id}")
     except Exception as e:
         print(f"Sync error: {e}")
 
