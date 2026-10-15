@@ -546,6 +546,18 @@ async def on_ready() -> None:
 # COMMANDS - PRIVATE ONLY
 # =========================
 @bot.tree.command(name="time", description="Start a breaching cooldown")
+@app_commands.choices(gang=[
+    app_commands.Choice(name="GenCorp", value="GenCorp"),
+    app_commands.Choice(name="Sinners MC", value="Sinners MC"),
+    app_commands.Choice(name="Wraith MC", value="Wraith MC"),
+    app_commands.Choice(name="Santos Cartel", value="Santos Cartel"),
+    app_commands.Choice(name="Outcasts", value="Outcasts"),
+    app_commands.Choice(name="Triads", value="Triads"),
+    app_commands.Choice(name="La Familia", value="La Familia"),
+    app_commands.Choice(name="Error", value="Error"),
+    app_commands.Choice(name="Vandals", value="Vandals"),
+    app_commands.Choice(name="Kimura", value="Kimura"),
+])
 @app_commands.describe(
     gang="Gang name",
     duration="HH:MM:SS format. Leave blank for 2 hours"
@@ -625,6 +637,18 @@ async def time_cmd(
 
 
 @bot.tree.command(name="grace", description="Start a grace timer")
+@app_commands.choices(gang=[
+    app_commands.Choice(name="GenCorp", value="GenCorp"),
+    app_commands.Choice(name="Sinners MC", value="Sinners MC"),
+    app_commands.Choice(name="Wraith MC", value="Wraith MC"),
+    app_commands.Choice(name="Santos Cartel", value="Santos Cartel"),
+    app_commands.Choice(name="Outcasts", value="Outcasts"),
+    app_commands.Choice(name="Triads", value="Triads"),
+    app_commands.Choice(name="La Familia", value="La Familia"),
+    app_commands.Choice(name="Error", value="Error"),
+    app_commands.Choice(name="Vandals", value="Vandals"),
+    app_commands.Choice(name="Kimura", value="Kimura"),
+])
 @app_commands.describe(
     gang="Gang name",
     start_time="Example: 7:00PM",
