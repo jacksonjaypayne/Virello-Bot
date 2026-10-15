@@ -91,7 +91,25 @@ CREATE TABLE IF NOT EXISTS grace_timers (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS bot_settings (
+    setting_key TEXT PRIMARY KEY,
+    setting_value TEXT NOT NULL
+)
+""")
+cursor.execute(
+    "INSERT OR IGNORE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
+    ("ev_available", "no")
+)
 conn.commit()
+
+def is_ev_available() -> bool:
+    row = conn.execute(
+        "SELECT setting_value FROM bot_settings WHERE setting_key=?",
+        ("ev_available",)
+    ).fetchone()
+    return bool(row and row[0] == "yes")
+
 
 timer_tasks: dict[tuple[int, str], asyncio.Task] = {}
 warning_tasks: dict[tuple[int, str], asyncio.Task] = {}
@@ -1240,6 +1258,53 @@ async def warehousecost_cmd(interaction: discord.Interaction, items: str) -> Non
         )
 
 
+@bot.tree.command(name="evavailable", description="Set EV price list availability (Leadership only)")
+@app_commands.describe(available="Allow public /pricelist access?")
+@app_commands.choices(available=[
+    app_commands.Choice(name="Yes", value="yes"),
+    app_commands.Choice(name="No", value="no"),
+])
+async def evavailable_cmd(
+    interaction: discord.Interaction,
+    available: app_commands.Choice[str]
+) -> None:
+    if not await ensure_private_guild(interaction):
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not any(
+        role.name.casefold() == "leadership" for role in member.roles
+    ):
+        await interaction.response.send_message(
+            embed=make_error_embed(
+                "❌ Permission Denied",
+                "Only members with the Leadership role can change EV availability."
+            ),
+            ephemeral=True
+        )
+        return
+
+    cursor.execute(
+        "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+        ("ev_available", available.value)
+    )
+    conn.commit()
+
+    enabled = available.value == "yes"
+    embed = discord.Embed(
+        title="✅ EV Available" if enabled else "🔴 EV Unavailable",
+        description=(
+            "The public Discord can now use `/pricelist`." if enabled
+            else "The public Discord will now receive: **EV is currently unavailable**."
+        ),
+        color=discord.Color.green() if enabled else discord.Color.red(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=f"Updated by {member.display_name}")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="pricelist", description="Post the current warehouse price list")
 async def pricelist_cmd(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
@@ -1258,6 +1323,13 @@ async def pricelist_cmd(interaction: discord.Interaction) -> None:
                 "❌ Command Not Allowed Here",
                 "The `/pricelist` command can only be used in the public server inside the allowed category."
             ),
+            ephemeral=True
+        )
+        return
+
+    if not is_ev_available():
+        await interaction.response.send_message(
+            "EV is currently unavailable",
             ephemeral=True
         )
         return
