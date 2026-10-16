@@ -25,6 +25,7 @@ TIMER_CHANNEL_ID = 1490304994975416451
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
 KOS_CHANNEL_ID = 1522965909256540190
 GANG_STATUS_CHANNEL_ID = 1503068250248839248
+GANG_STATUS_MESSAGE_ID = 1560593625761579009
 
 PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
@@ -495,11 +496,6 @@ _last_gang_board_content: str | None = None
 @tasks.loop(seconds=15)
 async def gang_grace_board_loop() -> None:
     global _last_gang_board_content
-    row = conn.execute(
-        "SELECT setting_value FROM bot_settings WHERE setting_key='gang_board_message_id'"
-    ).fetchone()
-    if not row:
-        return
     try:
         content = build_gang_board()
         if content == _last_gang_board_content:
@@ -530,43 +526,23 @@ async def gang_name_autocomplete(interaction: discord.Interaction, current: str)
     return [app_commands.Choice(name=name, value=name) for (name,) in rows
             if current.casefold() in name.casefold()][:25]
 
-async def publish_gang_board(guild: discord.Guild, create: bool = False) -> discord.Message:
+async def publish_gang_board(guild: discord.Guild) -> discord.Message:
     channel = guild.get_channel(GANG_STATUS_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         channel = await bot.fetch_channel(GANG_STATUS_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
         raise ValueError("Gang status channel is not a text channel.")
     content = build_gang_board()
-    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key='gang_board_message_id'").fetchone()
-    if row:
-        try:
-            message = await channel.fetch_message(int(row[0]))
-            await message.edit(content=content)
-            return message
-        except discord.NotFound:
-            pass
-    if not create:
-        raise ValueError("No managed board found. Run /gangstatussetup first.")
-    message = await channel.send(content)
-    conn.execute(
-        "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('gang_board_message_id', ?) "
-        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
-        (str(message.id),)
-    )
-    conn.commit()
-    return message
-
-@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
-@app_commands.default_permissions(manage_guild=True)
-@bot.tree.command(name="gangstatussetup", description="Create or update the managed gang status board")
-async def gangstatussetup_cmd(interaction: discord.Interaction):
-    if not await require_gang_leadership(interaction): return
-    await interaction.response.defer(ephemeral=True)
+    # Always edit the existing, fixed message. Never post a replacement.
     try:
-        msg = await publish_gang_board(interaction.guild, create=True)
-        await interaction.followup.send(f"✅ Gang status board ready: {msg.jump_url}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        message = await channel.fetch_message(GANG_STATUS_MESSAGE_ID)
+    except discord.NotFound as exc:
+        raise ValueError(
+            f"Gang board message {GANG_STATUS_MESSAGE_ID} was not found in this channel. "
+            "The bot will not create a replacement."
+        ) from exc
+    await message.edit(content=content)
+    return message
 
 @app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 @app_commands.default_permissions(manage_guild=True)
@@ -780,7 +756,7 @@ async def on_ready() -> None:
             bot.tree.clear_commands(guild=guild)
             if guild_id == PRIVATE_GUILD_ID:
                 bot.tree.add_command(evavailable_cmd, guild=guild)
-                for command in (gangstatussetup_cmd, gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd):
+                for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
