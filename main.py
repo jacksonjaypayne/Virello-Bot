@@ -22,6 +22,8 @@ PUBLIC_GUILD_ID = 1360621902674006176
 ALLOWED_GUILD_IDS = [PRIVATE_GUILD_ID, PUBLIC_GUILD_ID]
 
 TIMER_CHANNEL_ID = 1490304994975416451
+GRACE_CHANNEL_ID = 1560603781551362098
+COMMAND_GUIDE_CHANNEL_ID = 1560604669829582860
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
 KOS_CHANNEL_ID = 1522965909256540190
 GANG_STATUS_CHANNEL_ID = 1503068250248839248
@@ -71,7 +73,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # =========================
 # DATABASE
 # =========================
-conn = sqlite3.connect("timers.db")
+# Set DATABASE_PATH=/data/timers.db when a Railway volume is mounted at /data.
+# Never place this database inside a directory replaced during deployment.
+DATABASE_PATH = os.getenv("DATABASE_PATH", "timers.db")
+os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
+conn = sqlite3.connect(DATABASE_PATH, timeout=30)
+conn.execute("PRAGMA busy_timeout=30000")
+print(f"SQLite database: {os.path.abspath(DATABASE_PATH)}")
 cursor = conn.cursor()
 
 cursor.execute("""
@@ -126,10 +134,20 @@ initial_gangs = [
     ("Devils", "registered", "NO BEEF"),
     ("Balkans", "registered", "NO BEEF"),
 ]
-if conn.execute("SELECT COUNT(*) FROM gang_statuses").fetchone()[0] == 0:
-    conn.executemany(
+# Seed only on first-ever database initialization. If leadership removes all gangs,
+# restarting the bot must not silently recreate the default list.
+seeded = conn.execute(
+    "SELECT 1 FROM bot_settings WHERE setting_key='gang_statuses_initialized'"
+).fetchone()
+if not seeded:
+    if conn.execute("SELECT COUNT(*) FROM gang_statuses").fetchone()[0] == 0:
+        conn.executemany(
         "INSERT INTO gang_statuses (name, category, status, sort_order) VALUES (?, ?, ?, ?)",
-        [(name, category, status, i) for i, (name, category, status) in enumerate(initial_gangs)]
+            [(name, category, status, i) for i, (name, category, status) in enumerate(initial_gangs)]
+        )
+    conn.execute(
+        "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
+        ("gang_statuses_initialized", "yes")
     )
 conn.commit()
 
@@ -732,11 +750,91 @@ def schedule_timer_tasks(
         )
 
 # =========================
+# COMMAND GUIDE (ONE MESSAGE, UPDATED ON STARTUP)
+# =========================
+def build_command_guide() -> discord.Embed:
+    embed = discord.Embed(
+        title="📖 Virello Bot — Command Guide",
+        description="Available slash commands and what they do. Commands may be restricted by server, channel, or role.",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="⏱️ Breaching Timers", value=(
+        "`/time` — Start a gang breaching cooldown (2 hours by default).\n"
+        "`/timecheck` — Check a gang's remaining cooldown.\n"
+        "`/timecancel` — Cancel a gang's cooldown.\n"
+        "`/timelist` — Post all active cooldowns and grace periods.\n"
+        f"Cooldown messages: <#{TIMER_CHANNEL_ID}>"
+    ), inline=False)
+    embed.add_field(name="🔵 Grace", value=(
+        "`/grace` — Schedule a gang's grace period; the status board shows GRACE while active and restores its prior status afterward.\n"
+        f"Grace announcements: <#{GRACE_CHANNEL_ID}>"
+    ), inline=False)
+    embed.add_field(name="🚨 Gang Operations", value=(
+        "`/kos` — Announce Kill on Sight for a gang, with optional grace before it starts.\n"
+        "`/safe` — Announce that the compound is safe.\n"
+        "`/unsafe` — Announce that the compound is unsafe."
+    ), inline=False)
+    embed.add_field(name="📋 Gang Status Board (Leadership)", value=(
+        "`/gangadd` — Add a Syndicated or Registered gang.\n"
+        "`/gangstatus` — Change a gang to SHOOTING, NO BEEF, or WAR.\n"
+        "`/gangremove` — Remove a gang from the board.\n"
+        "`/gangstatusrefresh` — Refresh the existing status message.\n"
+        f"Board: <#{GANG_STATUS_CHANNEL_ID}>"
+    ), inline=False)
+    embed.add_field(name="📦 Warehouse & EV", value=(
+        "`/pricelist` — Show current warehouse sale prices (public price category; EV must be available).\n"
+        "`/warehousecost` — Calculate the sale price of requested items (public price category).\n"
+        "`/evavailable` — Enable or disable public price list access (Leadership; private server).\n"
+        "`/warehousereset` — Manually reset warehouse counts (private server)."
+    ), inline=False)
+    embed.set_footer(text="This guide is maintained automatically by the bot")
+    return embed
+
+
+async def publish_command_guide() -> None:
+    guild = bot.get_guild(PRIVATE_GUILD_ID)
+    if guild is None:
+        return
+    channel = guild.get_channel(COMMAND_GUIDE_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        print(f"Command guide channel {COMMAND_GUIDE_CHANNEL_ID} not found")
+        return
+    embed = build_command_guide()
+    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key=?", ("command_guide_message_id",)).fetchone()
+    if row:
+        try:
+            message = await channel.fetch_message(int(row[0]))
+            if message.author.id == bot.user.id:
+                await message.edit(embed=embed)
+                return
+        except (discord.NotFound, ValueError):
+            pass
+    # Recover an existing guide even if the local SQLite database was reset.
+    async for message in channel.history(limit=100):
+        if message.author.id == bot.user.id and any(e.title == embed.title for e in message.embeds):
+            await message.edit(embed=embed)
+            message_id = message.id
+            break
+    else:
+        message = await channel.send(embed=embed)
+        message_id = message.id
+    conn.execute("INSERT INTO bot_settings(setting_key,setting_value) VALUES(?,?) "
+                 "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                 ("command_guide_message_id", str(message_id)))
+    conn.commit()
+
+
+# =========================
 # READY EVENT
 # =========================
 @bot.event
 async def on_ready() -> None:
     print(f"Logged in as {bot.user}")
+
+    try:
+        await publish_command_guide()
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"Unable to publish command guide: {e}")
 
     if not gang_grace_board_loop.is_running():
         gang_grace_board_loop.start()
@@ -902,9 +1000,16 @@ async def grace_cmd(
     start_time: str,
     duration: str
 ) -> None:
-    guild, timer_channel = await ensure_private_guild_and_timer_channel(interaction)
+    if not await ensure_private_guild(interaction):
+        return
 
-    if guild is None or timer_channel is None:
+    guild = interaction.guild
+    grace_channel = guild.get_channel(GRACE_CHANNEL_ID)
+    if not isinstance(grace_channel, discord.TextChannel):
+        await interaction.response.send_message(
+            embed=make_error_embed("❌ Missing Grace Channel", f"I couldn't find <#{GRACE_CHANNEL_ID}>."),
+            ephemeral=True
+        )
         return
 
     gang = gang.strip()
@@ -967,7 +1072,7 @@ async def grace_cmd(
             gang.lower(),
             start_datetime.isoformat(),
             end_datetime.isoformat(),
-            TIMER_CHANNEL_ID
+            GRACE_CHANNEL_ID
         )
     )
     conn.commit()
@@ -990,10 +1095,10 @@ async def grace_cmd(
     embed.add_field(name="Ends", value=format_discord_time(end_datetime), inline=False)
     embed.set_footer(text=f"Started by {interaction.user.display_name}")
 
-    await timer_channel.send(embed=embed)
+    await grace_channel.send(embed=embed)
 
     await interaction.response.send_message(
-        f"✅ Posted grace timer for **{gang}** in <#{TIMER_CHANNEL_ID}>.",
+        f"✅ Posted grace timer for **{gang}** in <#{GRACE_CHANNEL_ID}>.",
         ephemeral=True
     )
 
