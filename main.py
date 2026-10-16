@@ -791,37 +791,74 @@ def build_command_guide() -> discord.Embed:
     return embed
 
 
-async def publish_command_guide() -> None:
-    guild = bot.get_guild(PRIVATE_GUILD_ID)
-    if guild is None:
-        return
-    channel = guild.get_channel(COMMAND_GUIDE_CHANNEL_ID)
+async def publish_command_guide() -> str:
+    """Create or update the command guide; return a human-readable result."""
+    channel = bot.get_channel(COMMAND_GUIDE_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(COMMAND_GUIDE_CHANNEL_ID)
     if not isinstance(channel, discord.TextChannel):
-        print(f"Command guide channel {COMMAND_GUIDE_CHANNEL_ID} not found")
-        return
+        raise RuntimeError(f"Command guide destination {COMMAND_GUIDE_CHANNEL_ID} is not a text channel")
+    if channel.guild.id != PRIVATE_GUILD_ID:
+        raise RuntimeError("Command guide channel is not in the configured private guild")
+
     embed = build_command_guide()
-    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key=?", ("command_guide_message_id",)).fetchone()
+    row = conn.execute(
+        "SELECT setting_value FROM bot_settings WHERE setting_key=?",
+        ("command_guide_message_id",),
+    ).fetchone()
     if row:
         try:
             message = await channel.fetch_message(int(row[0]))
-            if message.author.id == bot.user.id:
+            if bot.user and message.author.id == bot.user.id:
                 await message.edit(embed=embed)
-                return
+                print(f"Command guide updated: {message.id}")
+                return f"Updated existing command guide ({message.id})"
         except (discord.NotFound, ValueError):
             pass
-    # Recover an existing guide even if the local SQLite database was reset.
+
+    # Recover the guide if the local database was reset.
     async for message in channel.history(limit=100):
-        if message.author.id == bot.user.id and any(e.title == embed.title for e in message.embeds):
+        if bot.user and message.author.id == bot.user.id and any(
+            e.title == embed.title for e in message.embeds
+        ):
             await message.edit(embed=embed)
             message_id = message.id
             break
     else:
         message = await channel.send(embed=embed)
         message_id = message.id
-    conn.execute("INSERT INTO bot_settings(setting_key,setting_value) VALUES(?,?) "
-                 "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
-                 ("command_guide_message_id", str(message_id)))
+
+    conn.execute(
+        "INSERT INTO bot_settings(setting_key,setting_value) VALUES(?,?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+        ("command_guide_message_id", str(message_id)),
+    )
     conn.commit()
+    print(f"Command guide published: {message_id} in {channel.id}")
+    return f"Command guide published/updated in {channel.mention} ({message_id})"
+
+
+@app_commands.command(name="commandguide", description="Publish or refresh the bot command guide (Leadership only)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+async def commandguide_cmd(interaction: discord.Interaction) -> None:
+    if not await ensure_private_guild(interaction):
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not any(
+        role.name.casefold() == "leadership" for role in member.roles
+    ):
+        await interaction.response.send_message("❌ Leadership role required.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await publish_command_guide()
+        await interaction.followup.send(f"✅ {result}", ephemeral=True)
+    except Exception as exc:
+        print(f"Command guide manual publish failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send(
+            f"❌ Could not publish command guide: `{type(exc).__name__}: {exc}`",
+            ephemeral=True,
+        )
 
 
 # =========================
@@ -833,8 +870,8 @@ async def on_ready() -> None:
 
     try:
         await publish_command_guide()
-    except (discord.Forbidden, discord.HTTPException) as e:
-        print(f"Unable to publish command guide: {e}")
+    except Exception as e:
+        print(f"Unable to publish command guide: {type(e).__name__}: {e}")
 
     if not gang_grace_board_loop.is_running():
         gang_grace_board_loop.start()
@@ -854,6 +891,7 @@ async def on_ready() -> None:
             bot.tree.clear_commands(guild=guild)
             if guild_id == PRIVATE_GUILD_ID:
                 bot.tree.add_command(evavailable_cmd, guild=guild)
+                bot.tree.add_command(commandguide_cmd, guild=guild)
                 for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
