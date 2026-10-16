@@ -24,6 +24,7 @@ ALLOWED_GUILD_IDS = [PRIVATE_GUILD_ID, PUBLIC_GUILD_ID]
 TIMER_CHANNEL_ID = 1490304994975416451
 COMPOUND_STATUS_CHANNEL_ID = 1490340715761242292
 KOS_CHANNEL_ID = 1522965909256540190
+GANG_STATUS_CHANNEL_ID = 1503068250248839248
 
 PUBLIC_PRICE_CATEGORY_ID = 1361004589444239431
 
@@ -101,6 +102,34 @@ cursor.execute(
     "INSERT OR IGNORE INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
     ("ev_available", "no")
 )
+conn.commit()
+
+# Gang status board persistence
+cursor.execute("""CREATE TABLE IF NOT EXISTS gang_statuses (
+    name TEXT PRIMARY KEY COLLATE NOCASE,
+    category TEXT NOT NULL,
+    status TEXT NOT NULL,
+    sort_order INTEGER NOT NULL
+)""")
+initial_gangs = [
+    ("GenCorp", "syndicated", "SHOOTING"),
+    ("Sinners MC", "syndicated", "SHOOTING"),
+    ("Wraith MC", "syndicated", "SHOOTING"),
+    ("Santos Cartel", "syndicated", "SHOOTING"),
+    ("Outcasts", "syndicated", "SHOOTING"),
+    ("Triads", "syndicated", "SHOOTING"),
+    ("LaFamilia", "syndicated", "SHOOTING"),
+    ("Error", "syndicated", "SHOOTING"),
+    ("Vandals", "syndicated", "SHOOTING"),
+    ("Kimura", "syndicated", "SHOOTING"),
+    ("Devils", "registered", "NO BEEF"),
+    ("Balkans", "registered", "NO BEEF"),
+]
+if conn.execute("SELECT COUNT(*) FROM gang_statuses").fetchone()[0] == 0:
+    conn.executemany(
+        "INSERT INTO gang_statuses (name, category, status, sort_order) VALUES (?, ?, ?, ?)",
+        [(name, category, status, i) for i, (name, category, status) in enumerate(initial_gangs)]
+    )
 conn.commit()
 
 def is_ev_available() -> bool:
@@ -405,6 +434,201 @@ def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
     return embeds
 
 # =========================
+# GANG STATUS BOARD
+# =========================
+GANG_STATUSES = ["SHOOTING", "NO BEEF", "WAR", "GRACE"]
+GANG_CATEGORIES = ["syndicated", "registered"]
+
+def build_gang_board() -> str:
+    white = "\x1b[1;37m"
+    grey = "\x1b[1;30m"
+    reset = "\x1b[0m"
+    colors = {"SHOOTING": "\x1b[1;33m", "NO BEEF": "\x1b[1;32m", "WAR": "\x1b[1;31m", "GRACE": "\x1b[1;34m"}
+    lines = []
+    for category, title in [("syndicated", "SYNDICATED GANGS"), ("registered", "REGISTERED GANGS")]:
+        lines.extend([
+            f"{white}╔══════════════════════════════╗{reset}",
+            f"{white}║{title.center(30)}║{reset}",
+            f"{white}╚══════════════════════════════╝{reset}",
+            "",
+            f"{white}{'Gang':<16}Status{reset}",
+            f"{grey}------------------------{reset}"
+        ])
+        rows = conn.execute(
+            "SELECT name, status FROM gang_statuses WHERE category=? ORDER BY sort_order, name",
+            (category,)
+        ).fetchall()
+        for name, status in rows:
+            # Grace is a temporary display overlay; the saved beef status is untouched.
+            grace_row = conn.execute(
+                """SELECT start_time, end_time FROM grace_timers
+                   WHERE guild_id=? AND gang_name=? ORDER BY end_time DESC LIMIT 1""",
+                (PRIVATE_GUILD_ID, name.casefold())
+            ).fetchone()
+            if grace_row:
+                now = datetime.now(timezone.utc)
+                if parse_db_time(grace_row[0]) <= now < parse_db_time(grace_row[1]):
+                    status = "GRACE"
+            lines.append(f"{name:<16}{colors.get(status, white)}{status}{reset}")
+        lines.append("")
+    result = "```ansi\n" + "\n".join(lines).rstrip() + "\n```"
+    if len(result) > 2000:
+        raise ValueError("The gang status board exceeds Discord's 2000-character message limit.")
+    return result
+
+# Update only when the visible grace state changes, including after restarts.
+_last_gang_board_content: str | None = None
+
+@tasks.loop(seconds=15)
+async def gang_grace_board_loop() -> None:
+    global _last_gang_board_content
+    row = conn.execute(
+        "SELECT setting_value FROM bot_settings WHERE setting_key='gang_board_message_id'"
+    ).fetchone()
+    if not row:
+        return
+    try:
+        content = build_gang_board()
+        if content == _last_gang_board_content:
+            return
+        guild = bot.get_guild(PRIVATE_GUILD_ID)
+        if guild is None:
+            return
+        await publish_gang_board(guild)
+        _last_gang_board_content = content
+    except Exception as exc:
+        print(f"Grace status board update failed: {exc}")
+
+async def require_gang_leadership(interaction: discord.Interaction) -> bool:
+    if not await ensure_private_guild(interaction):
+        return False
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not any(
+        role.name.casefold() == "leadership" for role in member.roles
+    ):
+        await interaction.response.send_message(
+            "❌ Only members with the Leadership role can manage gang statuses.", ephemeral=True
+        )
+        return False
+    return True
+
+async def gang_name_autocomplete(interaction: discord.Interaction, current: str):
+    rows = conn.execute("SELECT name FROM gang_statuses ORDER BY category DESC, sort_order").fetchall()
+    return [app_commands.Choice(name=name, value=name) for (name,) in rows
+            if current.casefold() in name.casefold()][:25]
+
+async def publish_gang_board(guild: discord.Guild, create: bool = False) -> discord.Message:
+    channel = guild.get_channel(GANG_STATUS_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        channel = await bot.fetch_channel(GANG_STATUS_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        raise ValueError("Gang status channel is not a text channel.")
+    content = build_gang_board()
+    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key='gang_board_message_id'").fetchone()
+    if row:
+        try:
+            message = await channel.fetch_message(int(row[0]))
+            await message.edit(content=content)
+            return message
+        except discord.NotFound:
+            pass
+    if not create:
+        raise ValueError("No managed board found. Run /gangstatussetup first.")
+    message = await channel.send(content)
+    conn.execute(
+        "INSERT INTO bot_settings (setting_key, setting_value) VALUES ('gang_board_message_id', ?) "
+        "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+        (str(message.id),)
+    )
+    conn.commit()
+    return message
+
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="gangstatussetup", description="Create or update the managed gang status board")
+async def gangstatussetup_cmd(interaction: discord.Interaction):
+    if not await require_gang_leadership(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        msg = await publish_gang_board(interaction.guild, create=True)
+        await interaction.followup.send(f"✅ Gang status board ready: {msg.jump_url}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="gangadd", description="Add a syndicated or registered gang")
+@app_commands.choices(category=[app_commands.Choice(name="Syndicated", value="syndicated"), app_commands.Choice(name="Registered", value="registered")],
+                      status=[app_commands.Choice(name="Shooting", value="SHOOTING"), app_commands.Choice(name="No Beef", value="NO BEEF"), app_commands.Choice(name="War", value="WAR")])
+async def gangadd_cmd(interaction: discord.Interaction, name: str, category: str, status: str = "NO BEEF"):
+    if not await require_gang_leadership(interaction): return
+    name = name.strip()
+    if not name or len(name) > 16 or any(c in name for c in "\n\r\x1b`"):
+        await interaction.response.send_message("❌ Gang name must be 1–16 characters with no newlines or formatting codes.", ephemeral=True)
+        return
+    if conn.execute("SELECT 1 FROM gang_statuses WHERE name=?", (name,)).fetchone():
+        await interaction.response.send_message("❌ That gang already exists.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        conn.execute("INSERT INTO gang_statuses VALUES (?, ?, ?, ?)", (name, category, status,
+            conn.execute("SELECT COALESCE(MAX(sort_order), -1)+1 FROM gang_statuses").fetchone()[0]))
+        conn.commit()
+        msg = await publish_gang_board(interaction.guild)
+        await interaction.followup.send(f"✅ Added **{name}** ({category}, {status}). Updated {msg.jump_url}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Saved gang, but could not update board: {e}", ephemeral=True)
+
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="gangstatus", description="Change a gang's beef status")
+@app_commands.autocomplete(gang=gang_name_autocomplete)
+@app_commands.choices(status=[app_commands.Choice(name="Shooting", value="SHOOTING"), app_commands.Choice(name="No Beef", value="NO BEEF"), app_commands.Choice(name="War", value="WAR")])
+async def gangstatus_cmd(interaction: discord.Interaction, gang: str, status: str):
+    if not await require_gang_leadership(interaction): return
+    if not conn.execute("SELECT 1 FROM gang_statuses WHERE name=?", (gang,)).fetchone():
+        await interaction.response.send_message("❌ Gang not found.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    conn.execute("UPDATE gang_statuses SET status=? WHERE name=?", (status, gang))
+    conn.commit()
+    try:
+        msg = await publish_gang_board(interaction.guild)
+        await interaction.followup.send(f"✅ **{gang}** is now **{status}**. Updated {msg.jump_url}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Status saved, but board update failed: {e}", ephemeral=True)
+
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="gangremove", description="Remove a gang from the status board")
+@app_commands.autocomplete(gang=gang_name_autocomplete)
+async def gangremove_cmd(interaction: discord.Interaction, gang: str):
+    if not await require_gang_leadership(interaction): return
+    if not conn.execute("SELECT 1 FROM gang_statuses WHERE name=?", (gang,)).fetchone():
+        await interaction.response.send_message("❌ Gang not found.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    conn.execute("DELETE FROM gang_statuses WHERE name=?", (gang,))
+    conn.commit()
+    try:
+        msg = await publish_gang_board(interaction.guild)
+        await interaction.followup.send(f"✅ Removed **{gang}**. Updated {msg.jump_url}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Gang removed, but board update failed: {e}", ephemeral=True)
+
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.default_permissions(manage_guild=True)
+@bot.tree.command(name="gangstatusrefresh", description="Refresh the existing gang status board")
+async def gangstatusrefresh_cmd(interaction: discord.Interaction):
+    if not await require_gang_leadership(interaction): return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        msg = await publish_gang_board(interaction.guild)
+        await interaction.followup.send(f"✅ Refreshed {msg.jump_url}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ {e}", ephemeral=True)
+
+# =========================
 # TIMER TASKS
 # =========================
 async def send_warning(
@@ -525,6 +749,9 @@ def schedule_timer_tasks(
 async def on_ready() -> None:
     print(f"Logged in as {bot.user}")
 
+    if not gang_grace_board_loop.is_running():
+        gang_grace_board_loop.start()
+
     if not warehouse_daily_reset_loop.is_running():
         warehouse_daily_reset_loop.start()
         print("Warehouse daily reset loop started.")
@@ -540,6 +767,8 @@ async def on_ready() -> None:
             bot.tree.clear_commands(guild=guild)
             if guild_id == PRIVATE_GUILD_ID:
                 bot.tree.add_command(evavailable_cmd, guild=guild)
+                for command in (gangstatussetup_cmd, gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd):
+                    bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
     except Exception as e:
@@ -749,6 +978,12 @@ async def grace_cmd(
         )
     )
     conn.commit()
+
+    # Refresh immediately when the grace period is already active.
+    try:
+        await publish_gang_board(guild)
+    except Exception as exc:
+        print(f"Could not refresh gang board after /grace: {exc}")
 
     embed = discord.Embed(
         title="✅ Grace Started",
