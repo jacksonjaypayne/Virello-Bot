@@ -439,20 +439,28 @@ def build_price_embeds(items: list[tuple[str, str]]) -> list[discord.Embed]:
 GANG_STATUSES = ["SHOOTING", "NO BEEF", "WAR", "GRACE"]
 GANG_CATEGORIES = ["syndicated", "registered"]
 
+def normalized_gang_name(name: str) -> str:
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
+
 def build_gang_board() -> str:
     white = "\x1b[1;37m"
     grey = "\x1b[1;30m"
     reset = "\x1b[0m"
     colors = {"SHOOTING": "\x1b[1;33m", "NO BEEF": "\x1b[1;32m", "WAR": "\x1b[1;31m", "GRACE": "\x1b[1;34m"}
     lines = []
+    # Fixed column widths keep both sections aligned, including longer gang names.
+    gang_width = max(16, min(32, max((len(row[0]) for row in conn.execute(
+        "SELECT name FROM gang_statuses").fetchall()), default=0) + 2))
+    status_width = 8
+    divider = "─" * (gang_width + status_width)
     for category, title in [("syndicated", "SYNDICATED GANGS"), ("registered", "REGISTERED GANGS")]:
         lines.extend([
             f"{white}╔══════════════════════════════╗{reset}",
             f"{white}║{title.center(30)}║{reset}",
             f"{white}╚══════════════════════════════╝{reset}",
             "",
-            f"{white}{'Gang':<16}Status{reset}",
-            f"{grey}------------------------{reset}"
+            f"{white}{'Gang':<{gang_width}}Status{reset}",
+            f"{grey}{divider}{reset}"
         ])
         rows = conn.execute(
             "SELECT name, status FROM gang_statuses WHERE category=? ORDER BY sort_order, name",
@@ -460,16 +468,21 @@ def build_gang_board() -> str:
         ).fetchall()
         for name, status in rows:
             # Grace is a temporary display overlay; the saved beef status is untouched.
-            grace_row = conn.execute(
-                """SELECT start_time, end_time FROM grace_timers
-                   WHERE guild_id=? AND gang_name=? ORDER BY end_time DESC LIMIT 1""",
-                (PRIVATE_GUILD_ID, name.casefold())
-            ).fetchone()
+            grace_rows = conn.execute(
+                """SELECT gang_name, start_time, end_time FROM grace_timers
+                   WHERE guild_id=? ORDER BY end_time DESC""",
+                (PRIVATE_GUILD_ID,)
+            ).fetchall()
+            grace_row = next(
+                ((start, end) for stored_name, start, end in grace_rows
+                 if normalized_gang_name(stored_name) == normalized_gang_name(name)),
+                None
+            )
             if grace_row:
                 now = datetime.now(timezone.utc)
                 if parse_db_time(grace_row[0]) <= now < parse_db_time(grace_row[1]):
                     status = "GRACE"
-            lines.append(f"{name:<16}{colors.get(status, white)}{status}{reset}")
+            lines.append(f"{name:<{gang_width}}{colors.get(status, white)}{status}{reset}")
         lines.append("")
     result = "```ansi\n" + "\n".join(lines).rstrip() + "\n```"
     if len(result) > 2000:
@@ -950,8 +963,12 @@ async def grace_cmd(
         microsecond=0
     )
 
+    # A start time in the current minute begins immediately rather than tomorrow.
     if start_datetime_sydney < now_sydney:
-        start_datetime_sydney += timedelta(days=1)
+        if (now_sydney - start_datetime_sydney).total_seconds() < 60:
+            start_datetime_sydney = now_sydney
+        else:
+            start_datetime_sydney += timedelta(days=1)
 
     end_datetime_sydney = start_datetime_sydney + delta
 
@@ -987,7 +1004,7 @@ async def grace_cmd(
 
     embed = discord.Embed(
         title="✅ Grace Started",
-        description=f"Grace period started for **{gang}**.",
+        description=(f"Grace period active for **{gang}**." if start_datetime <= datetime.now(timezone.utc) else f"Grace period scheduled for **{gang}**."),
         color=discord.Color.blue(),
         timestamp=datetime.now(timezone.utc)
     )
