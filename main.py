@@ -46,7 +46,7 @@ VENDOR_MAP_PATH = os.getenv("VENDOR_MAP_PATH", "vendor_map.png")
 VENDOR_MAP_CHANNEL_ID = int(os.getenv("VENDOR_MAP_CHANNEL_ID", "1565636448290480220"))
 VENDOR_MAP_MESSAGE_ID = 1565642668271206491
 # Optional: use a separate PRIVATE channel for door screenshot storage.
-VENDOR_IMAGE_CHANNEL_ID = int(os.getenv("VENDOR_IMAGE_CHANNEL_ID", str(VENDOR_MAP_CHANNEL_ID)))
+VENDOR_IMAGE_CHANNEL_ID = int(os.getenv("VENDOR_IMAGE_CHANNEL_ID", "1565705331076505680"))
 
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
