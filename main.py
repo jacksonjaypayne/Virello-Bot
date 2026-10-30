@@ -44,6 +44,7 @@ VENDOR_SHEET_NAME = "Vendor Locations"
 VENDOR_CALIBRATION_SHEET = "Vendor Map Calibration"
 VENDOR_MAP_PATH = os.getenv("VENDOR_MAP_PATH", "vendor_map.png")
 VENDOR_MAP_CHANNEL_ID = int(os.getenv("VENDOR_MAP_CHANNEL_ID", "1565636448290480220"))
+VENDOR_MAP_MESSAGE_ID = 1565642668271206491
 
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
@@ -950,7 +951,7 @@ def draw_vendor_map(records):
         canvas = source.convert("RGBA")
     overlay = ImageDraw.Draw(canvas)
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 9)
     except OSError:
         font = ImageFont.load_default()
     placed, outside = [], []
@@ -960,9 +961,9 @@ def draw_vendor_map(records):
             outside.append(vendor["name"])
             continue
         # Numbered high-contrast marker; labels are listed in Discord embed.
-        radius = 15
+        radius = 6  # 60% smaller than the original 15px radius
         overlay.ellipse((px-radius, py-radius, px+radius, py+radius),
-                        fill=(18, 18, 18, 245), outline=(181, 255, 37, 255), width=4)
+                        fill=(18, 18, 18, 245), outline=(181, 255, 37, 255), width=2)
         label = str(i)
         bounds = overlay.textbbox((0, 0), label, font=font)
         overlay.text((px-(bounds[2]-bounds[0])/2, py-(bounds[3]-bounds[1])/2-bounds[1]),
@@ -972,6 +973,52 @@ def draw_vendor_map(records):
     canvas.save(output, format="PNG")
     output.seek(0)
     return output, placed, outside
+
+
+def build_vendor_embeds(placed, outside, total_saved):
+    """Put the numbered legend in a second embed, underneath the map image."""
+    map_embed = discord.Embed(
+        title="📍 Historical Vendor Map",
+        description="Historical vendor positions plotted from Google Sheets.",
+        color=discord.Color.green(),
+    )
+    map_embed.set_image(url="attachment://vendor_locations.png")
+
+    legend_lines = [
+        f"**{number}** — {discord.utils.escape_markdown(vendor['name'])}"
+        for number, vendor in placed
+    ]
+    if not legend_lines:
+        legend_lines = ["No visible vendor markers."]
+    if outside:
+        legend_lines.append(f"⚠️ {len(outside)} location(s) outside the map.")
+
+    # Discord permits up to 10 embeds per message and 4096 chars per description.
+    # Use up to 9 legend pages, retaining all marker numbers in the list.
+    pages = []
+    current = []
+    current_length = 0
+    for line in legend_lines:
+        if current and current_length + len(line) + 1 > 3900:
+            pages.append("\n".join(current))
+            current = []
+            current_length = 0
+        current.append(line)
+        current_length += len(line) + 1
+    if current:
+        pages.append("\n".join(current))
+    if len(pages) > 9:
+        pages = pages[:9]
+        pages[-1] += "\n⚠️ Additional entries omitted from legend."
+
+    embeds = [map_embed]
+    for page_number, page in enumerate(pages, 1):
+        title = "🔢 Vendor Legend" if page_number == 1 else f"🔢 Vendor Legend ({page_number})"
+        legend_embed = discord.Embed(title=title, description=page, color=discord.Color.green())
+        if page_number == len(pages):
+            legend_embed.set_footer(text=f"{len(placed)} plotted • {total_saved} saved • Google Sheets")
+        embeds.append(legend_embed)
+    return embeds
 
 
 async def publish_vendor_map() -> str:
@@ -986,10 +1033,6 @@ async def publish_vendor_map() -> str:
     records = await asyncio.to_thread(vendor_records)
     if records:
         output, placed, outside = await asyncio.to_thread(draw_vendor_map, records)
-        legend = [f"**{i}** — {discord.utils.escape_markdown(v['name'])}" for i, v in placed]
-        description = "\n".join(legend[:65])[:3500] or "No visible markers."
-        if outside:
-            description += f"\n⚠️ {len(outside)} location(s) outside the map."
     else:
         # Empty maps still replace the previous image after the last vendor is removed.
         def blank_map():
@@ -999,32 +1042,20 @@ async def publish_vendor_map() -> str:
                 buffer.seek(0)
                 return buffer
         output = await asyncio.to_thread(blank_map)
-        placed, description = [], "No historical vendors saved yet."
-    embed = discord.Embed(title="📍 Historical Vendor Map", description=description,
-                          color=discord.Color.green())
-    embed.set_image(url="attachment://vendor_locations.png")
-    embed.set_footer(text=f"{len(placed)} plotted • {len(records)} saved • Google Sheets")
-    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key=?",
-                       ("vendor_map_message_id",)).fetchone()
-    message = None
-    if row:
-        try:
-            message = await channel.fetch_message(int(row[0]))
-            if message.author.id != bot.user.id:
-                message = None
-        except (discord.NotFound, ValueError):
-            message = None
-    if message is None:
-        # Recover the existing map after a local SQLite reset.
-        async for candidate in channel.history(limit=100):
-            if candidate.author.id == bot.user.id and any(e.title == "📍 Historical Vendor Map" for e in candidate.embeds):
-                message = candidate
-                break
+        placed, outside = [], []
+    embeds = build_vendor_embeds(placed, outside, len(records))
+    # Edit only the explicitly configured message; never create duplicates.
+    try:
+        message = await channel.fetch_message(VENDOR_MAP_MESSAGE_ID)
+    except discord.NotFound as exc:
+        raise ValueError(
+            f"Vendor map message {VENDOR_MAP_MESSAGE_ID} was not found in "
+            f"channel {VENDOR_MAP_CHANNEL_ID}. No replacement was posted."
+        ) from exc
+    if bot.user is None or message.author.id != bot.user.id:
+        raise ValueError("Configured vendor map message was not authored by this bot.")
     attachment = discord.File(output, filename="vendor_locations.png")
-    if message:
-        await message.edit(embed=embed, attachments=[attachment])
-    else:
-        message = await channel.send(embed=embed, file=attachment)
+    await message.edit(embeds=embeds, attachments=[attachment])
     conn.execute("INSERT INTO bot_settings(setting_key, setting_value) VALUES (?, ?) "
                  "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
                  ("vendor_map_message_id", str(message.id)))
@@ -1209,19 +1240,11 @@ async def vendormap_cmd(interaction: discord.Interaction):
             await interaction.followup.send("No vendors saved yet. Leadership can use /vendoradd.", ephemeral=True)
             return
         output, placed, outside = await asyncio.to_thread(draw_vendor_map, records)
-        legend = [f"**{i}** — {discord.utils.escape_markdown(v['name'])}"
-                  for i, v in placed]
-        description = "\n".join(legend[:65])
-        if len(description) > 3500:
-            description = description[:3480] + "…"
-        if outside:
-            description += f"\n⚠️ {len(outside)} location(s) fell outside the image. Check calibration."
-        embed = discord.Embed(title="📍 Historical Vendor Map", description=description or "No visible markers.",
-                              color=discord.Color.green())
-        embed.set_image(url="attachment://vendor_locations.png")
-        embed.set_footer(text=f"{len(placed)} plotted • {len(records)} saved • Source: Google Sheets")
-        await interaction.followup.send(embed=embed,
-                                        file=discord.File(output, filename="vendor_locations.png"))
+        embeds = build_vendor_embeds(placed, outside, len(records))
+        await interaction.followup.send(
+            embeds=embeds,
+            file=discord.File(output, filename="vendor_locations.png"),
+        )
     except FileNotFoundError:
         await interaction.followup.send("❌ Map file missing. Set VENDOR_MAP_PATH to your deployed PNG.", ephemeral=True)
     except ValueError as exc:
