@@ -1,6 +1,8 @@
+
 discord.py
 python-dotenv
 tzdata
 gspread
 google-auth
 rapidfuzz
+Pillow
