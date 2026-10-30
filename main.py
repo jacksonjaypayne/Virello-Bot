@@ -886,7 +886,7 @@ async def commandguide_cmd(interaction: discord.Interaction) -> None:
 # =========================
 # Uses the same service account and spreadsheet as the warehouse.
 # Map calibration is intentionally required before rendering markers.
-VENDOR_HEADERS = ["Vendor Name", "X", "Y", "Z", "Description", "Image Channel ID", "Image Message ID"]
+VENDOR_HEADERS = ["Vendor Name", "X", "Y", "Z", "Description", "Image Channel ID", "Image Message ID", "Door Type", "Location"]
 CALIBRATION_HEADERS = ["World X", "World Y", "Pixel X", "Pixel Y"]
 
 
@@ -895,8 +895,8 @@ def vendor_sheet():
     try:
         ws = spreadsheet.worksheet(VENDOR_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=VENDOR_SHEET_NAME, rows=500, cols=7)
-        ws.update(range_name="A1:G1", values=[VENDOR_HEADERS])
+        ws = spreadsheet.add_worksheet(title=VENDOR_SHEET_NAME, rows=500, cols=9)
+        ws.update(range_name="A1:I1", values=[VENDOR_HEADERS])
     return ws
 
 
@@ -915,14 +915,16 @@ def vendor_records():
     for index, row in enumerate(vendor_sheet().get_all_values()[1:], start=2):
         if not row or not row[0].strip():
             continue
-        values = (row + [""] * 7)[:7]
+        values = (row + [""] * 9)[:9]
         try:
             records.append({"row": index, "name": values[0].strip(),
                             "x": float(values[1]), "y": float(values[2]),
                             "z": float(values[3]) if values[3] else 0.0,
                             "description": values[4],
                             "image_channel_id": values[5].strip(),
-                            "image_message_id": values[6].strip()})
+                            "image_message_id": values[6].strip(),
+                            "door_type": values[7].strip(),
+                            "location": values[8].strip()})
         except ValueError:
             print(f"Skipping invalid vendor row {index}")
     return records
@@ -956,26 +958,40 @@ def draw_vendor_map(records):
     anchors = get_calibration()
     with Image.open(VENDOR_MAP_PATH) as source:
         canvas = source.convert("RGBA")
-    overlay = ImageDraw.Draw(canvas)
+    # Render markers at 4x resolution, then downsample to the ORIGINAL map size.
+    # This smooths the tiny circles and numbers without resizing the final PNG.
+    scale = 4
+    hi = Image.new("RGBA", (canvas.width * scale, canvas.height * scale), (0, 0, 0, 0))
+    overlay = ImageDraw.Draw(hi)
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 9)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 10 * scale)
     except OSError:
-        font = ImageFont.load_default()
+        font = ImageFont.load_default(size=10 * scale)
     placed, outside = [], []
     for i, vendor in enumerate(records, start=1):
         px, py = vendor_pixel(vendor["x"], vendor["y"], anchors)
         if not (0 <= px < canvas.width and 0 <= py < canvas.height):
             outside.append(vendor["name"])
             continue
-        # Numbered high-contrast marker; labels are listed in Discord embed.
-        radius = 6  # 60% smaller than the original 15px radius
-        overlay.ellipse((px-radius, py-radius, px+radius, py+radius),
-                        fill=(18, 18, 18, 245), outline=(181, 255, 37, 255), width=2)
+        cx, cy = px * scale, py * scale
+        radius = 6 * scale  # unchanged final marker diameter (12 pixels)
+        overlay.ellipse((cx-radius, cy-radius, cx+radius, cy+radius),
+                        fill=(8, 12, 8, 255), outline=(210, 255, 65, 255), width=2*scale)
         label = str(i)
-        bounds = overlay.textbbox((0, 0), label, font=font)
-        overlay.text((px-(bounds[2]-bounds[0])/2, py-(bounds[3]-bounds[1])/2-bounds[1]),
-                     label, font=font, fill="white")
+        marker_font = font
+        if len(label) > 1:
+            try:
+                marker_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 7 * scale)
+            except OSError:
+                marker_font = ImageFont.load_default(size=7 * scale)
+        bounds = overlay.textbbox((0, 0), label, font=marker_font, stroke_width=0)
+        text_x = cx - (bounds[2]-bounds[0])/2
+        text_y = cy - (bounds[3]-bounds[1])/2 - bounds[1]
+        overlay.text((text_x, text_y), label, font=marker_font, fill=(255, 255, 255, 255),
+                     stroke_width=0)
         placed.append((i, vendor))
+    marker_layer = hi.resize(canvas.size, Image.Resampling.LANCZOS)
+    canvas = Image.alpha_composite(canvas, marker_layer)
     output = io.BytesIO()
     canvas.save(output, format="PNG")
     output.seek(0)
@@ -1098,13 +1114,15 @@ async def vendor_choices(interaction: discord.Interaction, current: str):
 @app_commands.command(name="vendoradd", description="Save an old vendor location (Leadership)")
 @app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 @app_commands.describe(name="Unique vendor name", x="GTA world X", y="GTA world Y",
-                       z="GTA world Z (optional)", description="Optional location notes")
+                       z="GTA world Z (optional)", description="Optional location notes",
+                       door_type="Door type (e.g. Single, Double)", location="Suburb or area")
 async def vendoradd_cmd(interaction: discord.Interaction, name: str, x: float, y: float,
-                        z: float = 0.0, description: str = ""):
+                        z: float = 0.0, description: str = "",
+                        door_type: str = "", location: str = ""):
     if not await vendor_leadership(interaction):
         return
     name = name.strip()
-    if not 1 <= len(name) <= 80 or len(description) > 300 or not all(map(math.isfinite, (x, y, z))):
+    if not 1 <= len(name) <= 80 or len(description) > 300 or len(door_type) > 100 or len(location) > 100 or not all(map(math.isfinite, (x, y, z))):
         await interaction.response.send_message("❌ Invalid name, description or coordinates.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
@@ -1113,7 +1131,7 @@ async def vendoradd_cmd(interaction: discord.Interaction, name: str, x: float, y
             records = vendor_records()
             if find_vendor(records, name):
                 return False
-            vendor_sheet().append_row([name, x, y, z, description], value_input_option="RAW")
+            vendor_sheet().append_row([name, x, y, z, description, "", "", door_type.strip(), location.strip()], value_input_option="RAW")
             return True
         created = await asyncio.to_thread(save)
         if created:
@@ -1178,10 +1196,13 @@ async def vendorremove_cmd(interaction: discord.Interaction, name: str):
 @app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 @app_commands.autocomplete(name=vendor_choices)
 async def vendoredit_cmd(interaction: discord.Interaction, name: str, x: float, y: float,
-                         z: float = 0.0, description: str = ""):
+                         z: float = 0.0, description: str = "",
+                         door_type: str | None = None, location: str | None = None):
     if not await vendor_leadership(interaction):
         return
-    if len(description) > 300 or not all(map(math.isfinite, (x, y, z))):
+    if (len(description) > 300 or (door_type is not None and len(door_type) > 100)
+            or (location is not None and len(location) > 100)
+            or not all(map(math.isfinite, (x, y, z)))):
         await interaction.response.send_message("❌ Invalid coordinates or description.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
@@ -1193,6 +1214,12 @@ async def vendoredit_cmd(interaction: discord.Interaction, name: str, x: float, 
             vendor_sheet().update(range_name=f"A{record['row']}:E{record['row']}",
                                   values=[[record["name"], x, y, z, description]],
                                   value_input_option="RAW")
+            if door_type is not None or location is not None:
+                vendor_sheet().update(
+                    range_name=f"H{record['row']}:I{record['row']}",
+                    values=[[record["door_type"] if door_type is None else door_type.strip(),
+                             record["location"] if location is None else location.strip()]],
+                    value_input_option="RAW")
             return True
         updated = await asyncio.to_thread(update)
         if updated:
@@ -1258,6 +1285,10 @@ async def vendor_cmd(interaction: discord.Interaction, name: str):
             return
         embed = discord.Embed(title=f"📍 {vendor['name']}", color=discord.Color.green())
         embed.add_field(name="Coordinates", value=f"X: `{vendor['x']:g}`  Y: `{vendor['y']:g}`  Z: `{vendor['z']:g}`", inline=False)
+        if vendor['door_type']:
+            embed.add_field(name="Door Type", value=vendor['door_type'], inline=True)
+        if vendor['location']:
+            embed.add_field(name="Location / Suburb", value=vendor['location'], inline=True)
         if vendor['description']:
             embed.add_field(name="Notes", value=vendor['description'][:1024], inline=False)
         if not vendor['image_message_id'] or not vendor['image_channel_id']:
@@ -1282,6 +1313,55 @@ async def vendor_cmd(interaction: discord.Interaction, name: str):
     except Exception as exc:
         print(f"Vendor lookup failed: {type(exc).__name__}: {exc}")
         await interaction.followup.send("❌ Could not retrieve vendor details.", ephemeral=True)
+
+
+@app_commands.command(name="findvendor", description="Find vendors by door type, location, or both")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.describe(door_type="Door type, e.g. Single or Double (optional if location provided)",
+                       location="Suburb/location, e.g. Pacific Ocean (optional if door type provided)")
+async def findvendor_cmd(interaction: discord.Interaction,
+                         door_type: str | None = None, location: str | None = None):
+    if not await ensure_private_guild(interaction):
+        return
+    door_filter = (door_type or "").strip()
+    location_filter = (location or "").strip()
+    if not door_filter and not location_filter:
+        await interaction.response.send_message(
+            "❌ Provide **door_type**, **location**, or both to search.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        records = await asyncio.to_thread(vendor_records)
+        matches = [v for v in records
+                   if (not door_filter or door_filter.casefold() in v["door_type"].casefold())
+                   and (not location_filter or location_filter.casefold() in v["location"].casefold())]
+        criteria = []
+        if door_filter:
+            criteria.append(f"Door: {discord.utils.escape_markdown(door_filter)}")
+        if location_filter:
+            criteria.append(f"Location: {discord.utils.escape_markdown(location_filter)}")
+        heading = " · ".join(criteria)
+        if not matches:
+            await interaction.followup.send(f"🔎 No vendors found for **{heading}**.", ephemeral=True)
+            return
+        lines = [f"**{discord.utils.escape_markdown(v['name'])}** — "
+                 f"{discord.utils.escape_markdown(v['door_type'] or 'Unspecified')} door · "
+                 f"{discord.utils.escape_markdown(v['location'] or 'Unknown location')} · "
+                 f"`{v['x']:g}, {v['y']:g}, {v['z']:g}`" for v in matches]
+        chunks, chunk = [], ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1800 and chunk:
+                chunks.append(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            chunks.append(chunk)
+        for index, body in enumerate(chunks):
+            header = f"🔎 **{len(matches)} vendor(s) found** — {heading}\n" if index == 0 else ""
+            await interaction.followup.send(header + body, ephemeral=True)
+    except Exception as exc:
+        print(f"Find vendor failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send("❌ Could not search vendor locations.", ephemeral=True)
 
 
 @app_commands.command(name="vendorimage", description="Upload or replace a vendor door screenshot (Leadership)")
@@ -1432,7 +1512,7 @@ async def on_ready() -> None:
                 bot.tree.add_command(commandguide_cmd, guild=guild)
                 for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd,
                                 vendoradd_cmd, vendorlist_cmd, vendorremove_cmd, vendoredit_cmd,
-                                vendorcalibrate_cmd, vendormap_cmd, vendor_cmd, vendorimage_cmd, vendorimageremove_cmd):
+                                vendorcalibrate_cmd, vendormap_cmd, vendor_cmd, findvendor_cmd, vendorimage_cmd, vendorimageremove_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
