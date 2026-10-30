@@ -45,6 +45,8 @@ VENDOR_CALIBRATION_SHEET = "Vendor Map Calibration"
 VENDOR_MAP_PATH = os.getenv("VENDOR_MAP_PATH", "vendor_map.png")
 VENDOR_MAP_CHANNEL_ID = int(os.getenv("VENDOR_MAP_CHANNEL_ID", "1565636448290480220"))
 VENDOR_MAP_MESSAGE_ID = 1565642668271206491
+# Optional: use a separate PRIVATE channel for door screenshot storage.
+VENDOR_IMAGE_CHANNEL_ID = int(os.getenv("VENDOR_IMAGE_CHANNEL_ID", str(VENDOR_MAP_CHANNEL_ID)))
 
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
@@ -799,7 +801,10 @@ def build_command_guide() -> discord.Embed:
         "`/vendormap` — Display saved vendor locations on the map.\n"
         "`/vendorlist` — List vendor coordinates.\n"
         "`/vendoradd`, `/vendoredit`, `/vendorremove` — Manage vendors (Leadership).\n"
-        "`/vendorcalibrate` — Set map reference points (Leadership)."
+        "`/vendorcalibrate` — Set map reference points (Leadership).\n"
+        "`/vendor` — View a vendor door screenshot and coordinates.\n"
+        "`/vendorimage` — Upload or replace a door screenshot (Leadership).\n"
+        "`/vendorimageremove` — Remove a door screenshot (Leadership)."
     ), inline=False)
     embed.set_footer(text="This guide is maintained automatically by the bot")
     return embed
@@ -881,7 +886,7 @@ async def commandguide_cmd(interaction: discord.Interaction) -> None:
 # =========================
 # Uses the same service account and spreadsheet as the warehouse.
 # Map calibration is intentionally required before rendering markers.
-VENDOR_HEADERS = ["Vendor Name", "X", "Y", "Z", "Description"]
+VENDOR_HEADERS = ["Vendor Name", "X", "Y", "Z", "Description", "Image Channel ID", "Image Message ID"]
 CALIBRATION_HEADERS = ["World X", "World Y", "Pixel X", "Pixel Y"]
 
 
@@ -890,8 +895,8 @@ def vendor_sheet():
     try:
         ws = spreadsheet.worksheet(VENDOR_SHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=VENDOR_SHEET_NAME, rows=500, cols=5)
-        ws.update(range_name="A1:E1", values=[VENDOR_HEADERS])
+        ws = spreadsheet.add_worksheet(title=VENDOR_SHEET_NAME, rows=500, cols=7)
+        ws.update(range_name="A1:G1", values=[VENDOR_HEADERS])
     return ws
 
 
@@ -910,12 +915,14 @@ def vendor_records():
     for index, row in enumerate(vendor_sheet().get_all_values()[1:], start=2):
         if not row or not row[0].strip():
             continue
-        values = (row + [""] * 5)[:5]
+        values = (row + [""] * 7)[:7]
         try:
             records.append({"row": index, "name": values[0].strip(),
                             "x": float(values[1]), "y": float(values[2]),
                             "z": float(values[3]) if values[3] else 0.0,
-                            "description": values[4]})
+                            "description": values[4],
+                            "image_channel_id": values[5].strip(),
+                            "image_message_id": values[6].strip()})
         except ValueError:
             print(f"Skipping invalid vendor row {index}")
     return records
@@ -1228,6 +1235,145 @@ async def vendorcalibrate_cmd(interaction: discord.Interaction,
         await interaction.followup.send(f"❌ Calibration failed: {exc}", ephemeral=True)
 
 
+async def vendor_image_channel():
+    channel = bot.get_channel(VENDOR_IMAGE_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(VENDOR_IMAGE_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel) or channel.guild.id != PRIVATE_GUILD_ID:
+        raise ValueError("VENDOR_IMAGE_CHANNEL_ID must be a text channel in the private server.")
+    return channel
+
+
+@app_commands.command(name="vendor", description="View a vendor's door screenshot and location")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.autocomplete(name=vendor_choices)
+async def vendor_cmd(interaction: discord.Interaction, name: str):
+    if not await ensure_private_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        vendor = find_vendor(await asyncio.to_thread(vendor_records), name)
+        if not vendor:
+            await interaction.followup.send("❌ Vendor not found.", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"📍 {vendor['name']}", color=discord.Color.green())
+        embed.add_field(name="Coordinates", value=f"X: `{vendor['x']:g}`  Y: `{vendor['y']:g}`  Z: `{vendor['z']:g}`", inline=False)
+        if vendor['description']:
+            embed.add_field(name="Notes", value=vendor['description'][:1024], inline=False)
+        if not vendor['image_message_id'] or not vendor['image_channel_id']:
+            embed.add_field(name="Door Screenshot", value="No screenshot uploaded yet.", inline=False)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        channel = bot.get_channel(int(vendor['image_channel_id']))
+        if channel is None:
+            channel = await bot.fetch_channel(int(vendor['image_channel_id']))
+        if not isinstance(channel, discord.TextChannel) or channel.guild.id != PRIVATE_GUILD_ID:
+            raise ValueError("Saved image channel is unavailable or not private.")
+        message = await channel.fetch_message(int(vendor['image_message_id']))
+        if not message.attachments:
+            raise ValueError("Saved screenshot message has no attachment.")
+        attachment = message.attachments[0]
+        image_bytes = await attachment.read()
+        filename = attachment.filename
+        embed.set_image(url=f"attachment://{filename}")
+        await interaction.followup.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=filename), ephemeral=True)
+    except (discord.NotFound, discord.Forbidden, ValueError) as exc:
+        await interaction.followup.send(f"⚠️ Screenshot unavailable: {exc}", ephemeral=True)
+    except Exception as exc:
+        print(f"Vendor lookup failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send("❌ Could not retrieve vendor details.", ephemeral=True)
+
+
+@app_commands.command(name="vendorimage", description="Upload or replace a vendor door screenshot (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.autocomplete(name=vendor_choices)
+@app_commands.describe(name="Existing vendor name", image="Screenshot of the vendor entrance")
+async def vendorimage_cmd(interaction: discord.Interaction, name: str, image: discord.Attachment):
+    if not await vendor_leadership(interaction):
+        return
+    valid_types = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+    if image.content_type not in valid_types or image.size > 8 * 1024 * 1024:
+        await interaction.response.send_message("❌ Upload a PNG, JPG, WEBP or GIF no larger than 8 MB.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        vendor = find_vendor(await asyncio.to_thread(vendor_records), name)
+        if not vendor:
+            await interaction.followup.send("❌ Vendor not found. Use /vendoradd first.", ephemeral=True)
+            return
+        channel = await vendor_image_channel()
+        data = await image.read()
+        extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}[image.content_type]
+        filename = f"vendor_door.{extension}"
+        new_message = await channel.send(
+            content=f"Door screenshot for vendor: {discord.utils.escape_mentions(vendor['name'])}",
+            file=discord.File(io.BytesIO(data), filename=filename),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            def save_image_ref():
+                current = find_vendor(vendor_records(), name)
+                if current is None:
+                    raise ValueError("Vendor was removed during upload.")
+                vendor_sheet().update(
+                    range_name=f"F{current['row']}:G{current['row']}",
+                    values=[[str(channel.id), str(new_message.id)]],
+                    value_input_option="RAW",
+                )
+            await asyncio.to_thread(save_image_ref)
+        except Exception:
+            await new_message.delete()
+            raise
+        # Clean up the old image only after the new reference has been saved.
+        if vendor['image_message_id'] and vendor['image_channel_id']:
+            try:
+                old_channel = bot.get_channel(int(vendor['image_channel_id'])) or await bot.fetch_channel(int(vendor['image_channel_id']))
+                if isinstance(old_channel, discord.TextChannel) and old_channel.guild.id == PRIVATE_GUILD_ID:
+                    old_msg = await old_channel.fetch_message(int(vendor['image_message_id']))
+                    if old_msg.author.id == bot.user.id:
+                        await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, ValueError):
+                pass
+        await interaction.followup.send(f"✅ Screenshot saved for **{discord.utils.escape_markdown(vendor['name'])}**. Members can use `/vendor` to view it.", ephemeral=True)
+    except Exception as exc:
+        print(f"Vendor image upload failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send(f"❌ Screenshot upload failed: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendorimageremove", description="Remove a vendor door screenshot (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.autocomplete(name=vendor_choices)
+async def vendorimageremove_cmd(interaction: discord.Interaction, name: str):
+    if not await vendor_leadership(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        vendor = find_vendor(await asyncio.to_thread(vendor_records), name)
+        if not vendor:
+            await interaction.followup.send("❌ Vendor not found.", ephemeral=True)
+            return
+        if not vendor['image_message_id']:
+            await interaction.followup.send("ℹ️ No screenshot is saved for this vendor.", ephemeral=True)
+            return
+        def clear_ref():
+            current = find_vendor(vendor_records(), name)
+            if not current:
+                raise ValueError("Vendor no longer exists.")
+            vendor_sheet().update(range_name=f"F{current['row']}:G{current['row']}", values=[["", ""]], value_input_option="RAW")
+        await asyncio.to_thread(clear_ref)
+        try:
+            channel = bot.get_channel(int(vendor['image_channel_id'])) or await bot.fetch_channel(int(vendor['image_channel_id']))
+            if isinstance(channel, discord.TextChannel) and channel.guild.id == PRIVATE_GUILD_ID:
+                old_msg = await channel.fetch_message(int(vendor['image_message_id']))
+                if old_msg.author.id == bot.user.id:
+                    await old_msg.delete()
+        except (discord.NotFound, discord.Forbidden, ValueError):
+            pass
+        await interaction.followup.send("✅ Vendor screenshot removed.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not remove screenshot: {exc}", ephemeral=True)
+
+
 @app_commands.command(name="vendormap", description="Show old vendor locations on the custom GTA map")
 @app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 async def vendormap_cmd(interaction: discord.Interaction):
@@ -1286,7 +1432,7 @@ async def on_ready() -> None:
                 bot.tree.add_command(commandguide_cmd, guild=guild)
                 for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd,
                                 vendoradd_cmd, vendorlist_cmd, vendorremove_cmd, vendoredit_cmd,
-                                vendorcalibrate_cmd, vendormap_cmd):
+                                vendorcalibrate_cmd, vendormap_cmd, vendor_cmd, vendorimage_cmd, vendorimageremove_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
