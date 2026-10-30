@@ -1315,10 +1315,51 @@ async def vendor_cmd(interaction: discord.Interaction, name: str):
         await interaction.followup.send("❌ Could not retrieve vendor details.", ephemeral=True)
 
 
+async def vendor_filter_choices(interaction: discord.Interaction, current: str, field: str):
+    """Autocomplete distinct values actually present in the Vendor Locations sheet."""
+    if interaction.guild_id != PRIVATE_GUILD_ID:
+        return []
+    try:
+        records = await asyncio.to_thread(vendor_records)
+        unique = {}
+        for vendor in records:
+            value = vendor[field].strip()
+            if value and current.casefold() in value.casefold():
+                unique.setdefault(value.casefold(), value)
+        return [app_commands.Choice(name=value[:100], value=value[:100])
+                for value in sorted(unique.values(), key=str.casefold)[:25]]
+    except Exception as exc:
+        print(f"Vendor filter autocomplete failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+async def vendor_door_type_choices(interaction: discord.Interaction, current: str):
+    return await vendor_filter_choices(interaction, current, "door_type")
+
+
+async def vendor_location_choices(interaction: discord.Interaction, current: str):
+    return await vendor_filter_choices(interaction, current, "location")
+
+
+@app_commands.command(name="vendorrefresh", description="Regenerate the existing vendor map and legend (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+async def vendorrefresh_cmd(interaction: discord.Interaction):
+    if not await vendor_leadership(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await publish_vendor_map()
+        await interaction.followup.send(f"✅ {result}", ephemeral=True)
+    except Exception as exc:
+        print(f"Vendor map refresh failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send(f"❌ Could not refresh vendor map: {exc}", ephemeral=True)
+
+
 @app_commands.command(name="findvendor", description="Find vendors by door type, location, or both")
 @app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
 @app_commands.describe(door_type="Door type, e.g. Single or Double (optional if location provided)",
                        location="Suburb/location, e.g. Pacific Ocean (optional if door type provided)")
+@app_commands.autocomplete(door_type=vendor_door_type_choices, location=vendor_location_choices)
 async def findvendor_cmd(interaction: discord.Interaction,
                          door_type: str | None = None, location: str | None = None):
     if not await ensure_private_guild(interaction):
@@ -1512,7 +1553,7 @@ async def on_ready() -> None:
                 bot.tree.add_command(commandguide_cmd, guild=guild)
                 for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd,
                                 vendoradd_cmd, vendorlist_cmd, vendorremove_cmd, vendoredit_cmd,
-                                vendorcalibrate_cmd, vendormap_cmd, vendor_cmd, findvendor_cmd, vendorimage_cmd, vendorimageremove_cmd):
+                                vendorcalibrate_cmd, vendormap_cmd, vendor_cmd, findvendor_cmd, vendorrefresh_cmd, vendorimage_cmd, vendorimageremove_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
