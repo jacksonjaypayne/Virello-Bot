@@ -43,6 +43,7 @@ SHEET_NAME = "warehouse"
 VENDOR_SHEET_NAME = "Vendor Locations"
 VENDOR_CALIBRATION_SHEET = "Vendor Map Calibration"
 VENDOR_MAP_PATH = os.getenv("VENDOR_MAP_PATH", "vendor_map.png")
+VENDOR_MAP_CHANNEL_ID = int(os.getenv("VENDOR_MAP_CHANNEL_ID", "1565636448290480220"))
 
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
@@ -973,6 +974,73 @@ def draw_vendor_map(records):
     return output, placed, outside
 
 
+async def publish_vendor_map() -> str:
+    """Maintain a single map post in the configured private-server channel."""
+    if not VENDOR_MAP_CHANNEL_ID:
+        return "Map saved, but VENDOR_MAP_CHANNEL_ID is not configured."
+    channel = bot.get_channel(VENDOR_MAP_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(VENDOR_MAP_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel) or channel.guild.id != PRIVATE_GUILD_ID:
+        raise ValueError("Vendor map channel must be a text channel in the private Discord.")
+    records = await asyncio.to_thread(vendor_records)
+    if records:
+        output, placed, outside = await asyncio.to_thread(draw_vendor_map, records)
+        legend = [f"**{i}** — {discord.utils.escape_markdown(v['name'])}" for i, v in placed]
+        description = "\n".join(legend[:65])[:3500] or "No visible markers."
+        if outside:
+            description += f"\n⚠️ {len(outside)} location(s) outside the map."
+    else:
+        # Empty maps still replace the previous image after the last vendor is removed.
+        def blank_map():
+            with Image.open(VENDOR_MAP_PATH) as im:
+                buffer = io.BytesIO()
+                im.convert("RGBA").save(buffer, "PNG")
+                buffer.seek(0)
+                return buffer
+        output = await asyncio.to_thread(blank_map)
+        placed, description = [], "No historical vendors saved yet."
+    embed = discord.Embed(title="📍 Historical Vendor Map", description=description,
+                          color=discord.Color.green())
+    embed.set_image(url="attachment://vendor_locations.png")
+    embed.set_footer(text=f"{len(placed)} plotted • {len(records)} saved • Google Sheets")
+    row = conn.execute("SELECT setting_value FROM bot_settings WHERE setting_key=?",
+                       ("vendor_map_message_id",)).fetchone()
+    message = None
+    if row:
+        try:
+            message = await channel.fetch_message(int(row[0]))
+            if message.author.id != bot.user.id:
+                message = None
+        except (discord.NotFound, ValueError):
+            message = None
+    if message is None:
+        # Recover the existing map after a local SQLite reset.
+        async for candidate in channel.history(limit=100):
+            if candidate.author.id == bot.user.id and any(e.title == "📍 Historical Vendor Map" for e in candidate.embeds):
+                message = candidate
+                break
+    attachment = discord.File(output, filename="vendor_locations.png")
+    if message:
+        await message.edit(embed=embed, attachments=[attachment])
+    else:
+        message = await channel.send(embed=embed, file=attachment)
+    conn.execute("INSERT INTO bot_settings(setting_key, setting_value) VALUES (?, ?) "
+                 "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                 ("vendor_map_message_id", str(message.id)))
+    conn.commit()
+    return f"Updated vendor map: {message.jump_url}"
+
+
+async def notify_vendor_map_update(interaction: discord.Interaction, result: str):
+    try:
+        result += "\n" + await publish_vendor_map()
+    except Exception as exc:
+        print(f"Vendor map publishing failed: {type(exc).__name__}: {exc}")
+        result += f"\n⚠️ Vendor saved in Google Sheets, but map publishing failed: {exc}"
+    await interaction.followup.send(result, ephemeral=True)
+
+
 async def vendor_leadership(interaction: discord.Interaction) -> bool:
     return await require_gang_leadership(interaction)
 
@@ -1010,9 +1078,10 @@ async def vendoradd_cmd(interaction: discord.Interaction, name: str, x: float, y
             vendor_sheet().append_row([name, x, y, z, description], value_input_option="RAW")
             return True
         created = await asyncio.to_thread(save)
-        await interaction.followup.send(
-            f"✅ Saved **{discord.utils.escape_markdown(name)}** at ({x}, {y}, {z})." if created
-            else "❌ A vendor with that name already exists.", ephemeral=True)
+        if created:
+            await notify_vendor_map_update(interaction, f"✅ Saved **{discord.utils.escape_markdown(name)}** at ({x}, {y}, {z}).")
+        else:
+            await interaction.followup.send("❌ A vendor with that name already exists.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Could not save vendor: {exc}", ephemeral=True)
 
@@ -1059,7 +1128,10 @@ async def vendorremove_cmd(interaction: discord.Interaction, name: str):
             vendor_sheet().delete_rows(record["row"])
             return True
         removed = await asyncio.to_thread(remove)
-        await interaction.followup.send("✅ Vendor removed." if removed else "❌ Vendor not found.", ephemeral=True)
+        if removed:
+            await notify_vendor_map_update(interaction, "✅ Vendor removed.")
+        else:
+            await interaction.followup.send("❌ Vendor not found.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Could not remove vendor: {exc}", ephemeral=True)
 
@@ -1085,7 +1157,10 @@ async def vendoredit_cmd(interaction: discord.Interaction, name: str, x: float, 
                                   value_input_option="RAW")
             return True
         updated = await asyncio.to_thread(update)
-        await interaction.followup.send("✅ Vendor updated." if updated else "❌ Vendor not found.", ephemeral=True)
+        if updated:
+            await notify_vendor_map_update(interaction, "✅ Vendor updated.")
+        else:
+            await interaction.followup.send("❌ Vendor not found.", ephemeral=True)
     except Exception as exc:
         await interaction.followup.send(f"❌ Could not update vendor: {exc}", ephemeral=True)
 
@@ -1117,7 +1192,7 @@ async def vendorcalibrate_cmd(interaction: discord.Interaction,
             ws.update(range_name="A1:D3", values=[CALIBRATION_HEADERS,
                 [x1, y1, px1, py1], [x2, y2, px2, py2]])
         await asyncio.to_thread(save)
-        await interaction.followup.send("✅ Calibration saved. Test with /vendormap and verify landmark alignment.", ephemeral=True)
+        await notify_vendor_map_update(interaction, "✅ Calibration saved. Check marker alignment against landmarks.")
     except Exception as exc:
         await interaction.followup.send(f"❌ Calibration failed: {exc}", ephemeral=True)
 
