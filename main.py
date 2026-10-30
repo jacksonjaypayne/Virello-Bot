@@ -958,15 +958,15 @@ def draw_vendor_map(records):
     anchors = get_calibration()
     with Image.open(VENDOR_MAP_PATH) as source:
         canvas = source.convert("RGBA")
-    # Render markers at 4x resolution, then downsample to the ORIGINAL map size.
+    # Render markers at 5x resolution, then downsample to the ORIGINAL map size.
     # This smooths the tiny circles and numbers without resizing the final PNG.
-    scale = 4
+    scale = 5
     hi = Image.new("RGBA", (canvas.width * scale, canvas.height * scale), (0, 0, 0, 0))
     overlay = ImageDraw.Draw(hi)
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 10 * scale)
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 8 * scale)
     except OSError:
-        font = ImageFont.load_default(size=10 * scale)
+        font = ImageFont.load_default(size=8 * scale)
     placed, outside = [], []
     for i, vendor in enumerate(records, start=1):
         px, py = vendor_pixel(vendor["x"], vendor["y"], anchors)
@@ -976,14 +976,14 @@ def draw_vendor_map(records):
         cx, cy = px * scale, py * scale
         radius = 6 * scale  # unchanged final marker diameter (12 pixels)
         overlay.ellipse((cx-radius, cy-radius, cx+radius, cy+radius),
-                        fill=(8, 12, 8, 255), outline=(210, 255, 65, 255), width=2*scale)
+                        fill=(8, 12, 8, 255), outline=(255, 35, 35, 255), width=2*scale)
         label = str(i)
         marker_font = font
         if len(label) > 1:
             try:
-                marker_font = ImageFont.truetype("DejaVuSans-Bold.ttf", 7 * scale)
+                marker_font = ImageFont.truetype("DejaVuSans-Bold.ttf", round(5.6 * scale))
             except OSError:
-                marker_font = ImageFont.load_default(size=7 * scale)
+                marker_font = ImageFont.load_default(size=round(5.6 * scale))
         bounds = overlay.textbbox((0, 0), label, font=marker_font, stroke_width=0)
         text_x = cx - (bounds[2]-bounds[0])/2
         text_y = cy - (bounds[3]-bounds[1])/2 - bounds[1]
