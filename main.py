@@ -2,6 +2,9 @@ import os
 import json
 import asyncio
 import sqlite3
+import io
+import math
+from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -37,6 +40,9 @@ SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 SPREADSHEET_ID = "15NdYUrKpDQ8_gVktxUvOJ-dWyObgoN4cPpN28XQy8N8"
 SHEET_NAME = "warehouse"
+VENDOR_SHEET_NAME = "Vendor Locations"
+VENDOR_CALIBRATION_SHEET = "Vendor Map Calibration"
+VENDOR_MAP_PATH = os.getenv("VENDOR_MAP_PATH", "vendor_map.png")
 
 # Column B = item name, Column D = sale price
 ITEM_COLUMN_INDEX = 1
@@ -787,6 +793,12 @@ def build_command_guide() -> discord.Embed:
         "`/evavailable` — Enable or disable public price list access (Leadership; private server).\n"
         "`/warehousereset` — Manually reset warehouse counts (private server)."
     ), inline=False)
+    embed.add_field(name="📍 Historical Vendor Map", value=(
+        "`/vendormap` — Display saved vendor locations on the map.\n"
+        "`/vendorlist` — List vendor coordinates.\n"
+        "`/vendoradd`, `/vendoredit`, `/vendorremove` — Manage vendors (Leadership).\n"
+        "`/vendorcalibrate` — Set map reference points (Leadership)."
+    ), inline=False)
     embed.set_footer(text="This guide is maintained automatically by the bot")
     return embed
 
@@ -861,6 +873,288 @@ async def commandguide_cmd(interaction: discord.Interaction) -> None:
         )
 
 
+
+# =========================
+# HISTORICAL VENDOR MAP
+# =========================
+# Uses the same service account and spreadsheet as the warehouse.
+# Map calibration is intentionally required before rendering markers.
+VENDOR_HEADERS = ["Vendor Name", "X", "Y", "Z", "Description"]
+CALIBRATION_HEADERS = ["World X", "World Y", "Pixel X", "Pixel Y"]
+
+
+def vendor_sheet():
+    spreadsheet = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    try:
+        ws = spreadsheet.worksheet(VENDOR_SHEET_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=VENDOR_SHEET_NAME, rows=500, cols=5)
+        ws.update(range_name="A1:E1", values=[VENDOR_HEADERS])
+    return ws
+
+
+def calibration_sheet():
+    spreadsheet = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    try:
+        ws = spreadsheet.worksheet(VENDOR_CALIBRATION_SHEET)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=VENDOR_CALIBRATION_SHEET, rows=20, cols=4)
+        ws.update(range_name="A1:D1", values=[CALIBRATION_HEADERS])
+    return ws
+
+
+def vendor_records():
+    records = []
+    for index, row in enumerate(vendor_sheet().get_all_values()[1:], start=2):
+        if not row or not row[0].strip():
+            continue
+        values = (row + [""] * 5)[:5]
+        try:
+            records.append({"row": index, "name": values[0].strip(),
+                            "x": float(values[1]), "y": float(values[2]),
+                            "z": float(values[3]) if values[3] else 0.0,
+                            "description": values[4]})
+        except ValueError:
+            print(f"Skipping invalid vendor row {index}")
+    return records
+
+
+def find_vendor(records, name):
+    return next((v for v in records if v["name"].casefold() == name.strip().casefold()), None)
+
+
+def get_calibration():
+    anchors = []
+    for row in calibration_sheet().get_all_values()[1:]:
+        if len(row) >= 4 and all(v.strip() for v in row[:4]):
+            anchors.append(tuple(float(v) for v in row[:4]))
+    if len(anchors) < 2:
+        raise ValueError("Map not calibrated. Leadership must run /vendorcalibrate with two known points.")
+    a, b = anchors[:2]
+    if abs(a[0] - b[0]) < 1 or abs(a[1] - b[1]) < 1:
+        raise ValueError("Calibration anchors need different world X and Y coordinates.")
+    return a, b
+
+
+def vendor_pixel(x, y, anchors):
+    a, b = anchors
+    px = a[2] + (x - a[0]) * (b[2] - a[2]) / (b[0] - a[0])
+    py = a[3] + (y - a[1]) * (b[3] - a[3]) / (b[1] - a[1])
+    return round(px), round(py)
+
+
+def draw_vendor_map(records):
+    anchors = get_calibration()
+    with Image.open(VENDOR_MAP_PATH) as source:
+        canvas = source.convert("RGBA")
+    overlay = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 18)
+    except OSError:
+        font = ImageFont.load_default()
+    placed, outside = [], []
+    for i, vendor in enumerate(records, start=1):
+        px, py = vendor_pixel(vendor["x"], vendor["y"], anchors)
+        if not (0 <= px < canvas.width and 0 <= py < canvas.height):
+            outside.append(vendor["name"])
+            continue
+        # Numbered high-contrast marker; labels are listed in Discord embed.
+        radius = 15
+        overlay.ellipse((px-radius, py-radius, px+radius, py+radius),
+                        fill=(18, 18, 18, 245), outline=(181, 255, 37, 255), width=4)
+        label = str(i)
+        bounds = overlay.textbbox((0, 0), label, font=font)
+        overlay.text((px-(bounds[2]-bounds[0])/2, py-(bounds[3]-bounds[1])/2-bounds[1]),
+                     label, font=font, fill="white")
+        placed.append((i, vendor))
+    output = io.BytesIO()
+    canvas.save(output, format="PNG")
+    output.seek(0)
+    return output, placed, outside
+
+
+async def vendor_leadership(interaction: discord.Interaction) -> bool:
+    return await require_gang_leadership(interaction)
+
+
+async def vendor_choices(interaction: discord.Interaction, current: str):
+    if interaction.guild_id != PRIVATE_GUILD_ID:
+        return []
+    try:
+        records = await asyncio.to_thread(vendor_records)
+        return [app_commands.Choice(name=v["name"][:100], value=v["name"][:100])
+                for v in records if current.casefold() in v["name"].casefold()][:25]
+    except Exception as exc:
+        print(f"Vendor autocomplete failed: {exc}")
+        return []
+
+
+@app_commands.command(name="vendoradd", description="Save an old vendor location (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.describe(name="Unique vendor name", x="GTA world X", y="GTA world Y",
+                       z="GTA world Z (optional)", description="Optional location notes")
+async def vendoradd_cmd(interaction: discord.Interaction, name: str, x: float, y: float,
+                        z: float = 0.0, description: str = ""):
+    if not await vendor_leadership(interaction):
+        return
+    name = name.strip()
+    if not 1 <= len(name) <= 80 or len(description) > 300 or not all(map(math.isfinite, (x, y, z))):
+        await interaction.response.send_message("❌ Invalid name, description or coordinates.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        def save():
+            records = vendor_records()
+            if find_vendor(records, name):
+                return False
+            vendor_sheet().append_row([name, x, y, z, description], value_input_option="RAW")
+            return True
+        created = await asyncio.to_thread(save)
+        await interaction.followup.send(
+            f"✅ Saved **{discord.utils.escape_markdown(name)}** at ({x}, {y}, {z})." if created
+            else "❌ A vendor with that name already exists.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not save vendor: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendorlist", description="List historical vendor locations")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+async def vendorlist_cmd(interaction: discord.Interaction):
+    if not await ensure_private_guild(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        records = await asyncio.to_thread(vendor_records)
+        if not records:
+            await interaction.followup.send("No vendors have been saved yet.", ephemeral=True)
+            return
+        lines = [f"**{i}. {discord.utils.escape_markdown(v['name'])}** — X: {v['x']:g}, Y: {v['y']:g}, Z: {v['z']:g}"
+                 for i, v in enumerate(records, 1)]
+        chunks, chunk = [], ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1800:
+                chunks.append(chunk)
+                chunk = ""
+            chunk += line + "\n"
+        if chunk:
+            chunks.append(chunk)
+        for text in chunks[:10]:
+            await interaction.followup.send(text, ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not load vendors: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendorremove", description="Delete a saved vendor (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.autocomplete(name=vendor_choices)
+async def vendorremove_cmd(interaction: discord.Interaction, name: str):
+    if not await vendor_leadership(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        def remove():
+            record = find_vendor(vendor_records(), name)
+            if not record:
+                return False
+            vendor_sheet().delete_rows(record["row"])
+            return True
+        removed = await asyncio.to_thread(remove)
+        await interaction.followup.send("✅ Vendor removed." if removed else "❌ Vendor not found.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not remove vendor: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendoredit", description="Update an existing vendor (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.autocomplete(name=vendor_choices)
+async def vendoredit_cmd(interaction: discord.Interaction, name: str, x: float, y: float,
+                         z: float = 0.0, description: str = ""):
+    if not await vendor_leadership(interaction):
+        return
+    if len(description) > 300 or not all(map(math.isfinite, (x, y, z))):
+        await interaction.response.send_message("❌ Invalid coordinates or description.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        def update():
+            record = find_vendor(vendor_records(), name)
+            if not record:
+                return False
+            vendor_sheet().update(range_name=f"A{record['row']}:E{record['row']}",
+                                  values=[[record["name"], x, y, z, description]],
+                                  value_input_option="RAW")
+            return True
+        updated = await asyncio.to_thread(update)
+        await interaction.followup.send("✅ Vendor updated." if updated else "❌ Vendor not found.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not update vendor: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendorcalibrate", description="Set two GTA-to-map reference points (Leadership)")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+@app_commands.describe(x1="First GTA X", y1="First GTA Y", px1="First map pixel X",
+                       py1="First map pixel Y", x2="Second GTA X", y2="Second GTA Y",
+                       px2="Second map pixel X", py2="Second map pixel Y")
+async def vendorcalibrate_cmd(interaction: discord.Interaction,
+                              x1: float, y1: float, px1: int, py1: int,
+                              x2: float, y2: float, px2: int, py2: int):
+    if not await vendor_leadership(interaction):
+        return
+    if (abs(x2-x1) < 1 or abs(y2-y1) < 1 or
+            not all(map(math.isfinite, (x1, y1, x2, y2)))):
+        await interaction.response.send_message("❌ Reference points need distinct world X and Y values.", ephemeral=True)
+        return
+    with Image.open(VENDOR_MAP_PATH) as im:
+        width, height = im.size
+    if not all(0 <= px < width and 0 <= py < height for px, py in ((px1, py1), (px2, py2))):
+        await interaction.response.send_message(f"❌ Pixel points must fit within {width}×{height}.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        def save():
+            ws = calibration_sheet()
+            ws.clear()
+            ws.update(range_name="A1:D3", values=[CALIBRATION_HEADERS,
+                [x1, y1, px1, py1], [x2, y2, px2, py2]])
+        await asyncio.to_thread(save)
+        await interaction.followup.send("✅ Calibration saved. Test with /vendormap and verify landmark alignment.", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Calibration failed: {exc}", ephemeral=True)
+
+
+@app_commands.command(name="vendormap", description="Show old vendor locations on the custom GTA map")
+@app_commands.guilds(discord.Object(id=PRIVATE_GUILD_ID))
+async def vendormap_cmd(interaction: discord.Interaction):
+    if not await ensure_private_guild(interaction):
+        return
+    await interaction.response.defer()
+    try:
+        records = await asyncio.to_thread(vendor_records)
+        if not records:
+            await interaction.followup.send("No vendors saved yet. Leadership can use /vendoradd.", ephemeral=True)
+            return
+        output, placed, outside = await asyncio.to_thread(draw_vendor_map, records)
+        legend = [f"**{i}** — {discord.utils.escape_markdown(v['name'])}"
+                  for i, v in placed]
+        description = "\n".join(legend[:65])
+        if len(description) > 3500:
+            description = description[:3480] + "…"
+        if outside:
+            description += f"\n⚠️ {len(outside)} location(s) fell outside the image. Check calibration."
+        embed = discord.Embed(title="📍 Historical Vendor Map", description=description or "No visible markers.",
+                              color=discord.Color.green())
+        embed.set_image(url="attachment://vendor_locations.png")
+        embed.set_footer(text=f"{len(placed)} plotted • {len(records)} saved • Source: Google Sheets")
+        await interaction.followup.send(embed=embed,
+                                        file=discord.File(output, filename="vendor_locations.png"))
+    except FileNotFoundError:
+        await interaction.followup.send("❌ Map file missing. Set VENDOR_MAP_PATH to your deployed PNG.", ephemeral=True)
+    except ValueError as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+    except Exception as exc:
+        print(f"Vendor map failed: {type(exc).__name__}: {exc}")
+        await interaction.followup.send(f"❌ Map generation failed: {exc}", ephemeral=True)
+
 # =========================
 # READY EVENT
 # =========================
@@ -892,7 +1186,9 @@ async def on_ready() -> None:
             if guild_id == PRIVATE_GUILD_ID:
                 bot.tree.add_command(evavailable_cmd, guild=guild)
                 bot.tree.add_command(commandguide_cmd, guild=guild)
-                for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd):
+                for command in (gangadd_cmd, gangstatus_cmd, gangremove_cmd, gangstatusrefresh_cmd,
+                                vendoradd_cmd, vendorlist_cmd, vendorremove_cmd, vendoredit_cmd,
+                                vendorcalibrate_cmd, vendormap_cmd):
                     bot.tree.add_command(command, guild=guild)
             guild_synced = await bot.tree.sync(guild=guild)
             print(f"Synced {len(guild_synced)} guild commands for {guild_id}: {[c.name for c in guild_synced]}")
